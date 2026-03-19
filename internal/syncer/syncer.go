@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"sftpsync/internal/config"
-	sftpclient "sftpsync/internal/sftp"
-	"sftpsync/internal/state"
+	"github.com/r1chjames/sftp-sync/internal/config"
+	sftpclient "github.com/r1chjames/sftp-sync/internal/sftp"
+	"github.com/r1chjames/sftp-sync/internal/state"
 )
 
 // SyncStatus is a snapshot of the syncer's current state.
@@ -142,10 +142,8 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 	var wg sync.WaitGroup
 
 	for _, f := range files {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			break
-		default:
 		}
 
 		wg.Add(1)

@@ -1,4 +1,4 @@
-module sftpsync
+module github.com/r1chjames/sftp-sync
 
 go 1.22
 

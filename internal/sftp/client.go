@@ -12,7 +12,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
-	"sftpsync/internal/config"
+	"github.com/r1chjames/sftp-sync/internal/config"
 )
 
 // RemoteFile represents a file discovered on the SFTP server.
