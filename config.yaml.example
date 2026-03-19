@@ -1,0 +1,36 @@
+sftp:
+  host: photos.example.com
+  port: 22
+  user: myuser
+
+  # Authentication — use one of: password, key_path, or leave both blank to use ssh-agent.
+  # key_path: ~/.ssh/id_rsa
+  # password: secret
+
+  remote_path: /photos
+
+  # Set true to skip host key verification (not recommended for production).
+  # insecure_ignore_host_key: false
+
+# Local directory where photos will be synced to.
+local_path: ~/Pictures/sftp-sync
+
+sync:
+  # How often to poll the SFTP server for changes.
+  interval: 60s
+
+  # Number of concurrent download goroutines.
+  workers: 4
+
+  # File extensions to sync. Leave empty to sync all files.
+  extensions:
+    - .jpg
+    - .jpeg
+    - .png
+    - .raw
+    - .heic
+    - .tiff
+
+# Path for the state manifest (tracks what has been synced).
+# Defaults to ~/.local/share/sftpsync/manifest.json
+# state_path: ~/.local/share/sftpsync/manifest.json

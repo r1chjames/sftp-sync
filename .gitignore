@@ -1,0 +1,14 @@
+# Binary
+sftpsync
+
+# Config (contains credentials)
+config.yaml
+
+# Go
+vendor/
+
+# GoLand
+.idea/
+
+# macOS
+.DS_Store
