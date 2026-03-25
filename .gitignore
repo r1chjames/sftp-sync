@@ -1,5 +1,7 @@
-# Binary
-sftpsync
+#Binaries
+/sftpsync
+/sftpsyncbar
+/sftpsyncd
 
 # Config (contains credentials)
 config.yaml
