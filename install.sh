@@ -49,7 +49,7 @@ sudo install -m 755 "$TMP/sftpsync"  "$INSTALL_DIR/sftpsync"
 # macOS-only: install sftpsyncbar.app and LaunchAgent
 if [ "$OS" = "darwin" ]; then
   echo "  Downloading sftpsyncbar..."
-  curl -fsSL "$BASE_URL/sftpsyncbar-darwin-${ARCH}.zip" -o "$TMP/sftpsyncbar.zip"
+  curl -fsSL "$BASE_URL/sftpsyncbar-darwin-arm64.zip" -o "$TMP/sftpsyncbar.zip"
   unzip -q "$TMP/sftpsyncbar.zip" -d "$TMP"
   echo "Installing sftpsyncbar.app to /Applications (may prompt for sudo)..."
   sudo rm -rf /Applications/sftpsyncbar.app

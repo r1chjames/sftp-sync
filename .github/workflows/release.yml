@@ -48,9 +48,6 @@ jobs:
 
   build-bar:
     runs-on: macos-latest
-    strategy:
-      matrix:
-        goarch: [amd64, arm64]
 
     steps:
       - uses: actions/checkout@v4
@@ -59,21 +56,22 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build sftpsyncbar and package .app bundle
-        env:
-          GOARCH: ${{ matrix.goarch }}
+      - name: Build sftpsyncbar (arm64)
         run: |
           go build -ldflags="-s -w" -o sftpsyncbar-bin ./cmd/sftpsyncbar
+
+      - name: Package .app bundle
+        run: |
           mkdir -p sftpsyncbar.app/Contents/MacOS
           mv sftpsyncbar-bin sftpsyncbar.app/Contents/MacOS/sftpsyncbar
           cp cmd/sftpsyncbar/Info.plist sftpsyncbar.app/Contents/Info.plist
-          zip -r "sftpsyncbar-darwin-${GOARCH}.zip" sftpsyncbar.app
+          zip -r sftpsyncbar-darwin-arm64.zip sftpsyncbar.app
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sftp-sync-bar-darwin-${{ matrix.goarch }}
-          path: sftpsyncbar-*.zip
+          name: sftp-sync-bar-darwin
+          path: sftpsyncbar-darwin-*.zip
 
   release:
     needs: [build, build-bar]
