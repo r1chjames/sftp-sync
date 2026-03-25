@@ -17,40 +17,50 @@ A lightweight Go daemon that manages multiple SFTP sync jobs, each with its own 
 
 ## Requirements
 
-- Go 1.22+
+- macOS or Linux
 - SSH access to an SFTP server
 
 ## Installation
 
+### macOS / Linux (recommended)
+
 ```bash
-git clone <repo>
-cd sftpsync
+curl -fsSL https://raw.githubusercontent.com/r1chjames/sftp-sync/main/install.sh | bash
+```
+
+This installs `sftpsyncd` and `sftpsync` to `/usr/local/bin`. On macOS it also installs `sftpsyncbar.app` to `/Applications` and registers a LaunchAgent so the daemon starts at login.
+
+To install a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r1chjames/sftp-sync/main/install.sh | bash -s v0.1.8
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/r1chjames/sftp-sync
+cd sftp-sync
 go build -o sftpsyncd ./cmd/sftpsyncd   # daemon
 go build -o sftpsync  ./cmd/sftpsync    # CLI client
 ```
 
 ## Quick start
 
-Start the daemon (runs in the foreground):
-
-```bash
-./sftpsyncd
-```
-
 Submit a sync job using a config file:
 
 ```bash
-./sftpsync add /path/to/config.yaml
+sftpsync add /path/to/config.yaml
 ```
 
 List and manage jobs:
 
 ```bash
-./sftpsync list
-./sftpsync status
-./sftpsync status <id>
-./sftpsync remove <id>
-./sftpsync stop       # shut down the daemon
+sftpsync list
+sftpsync status
+sftpsync status <id>
+sftpsync remove <id>
+sftpsync stop       # shut down the daemon
 ```
 
 ## Configuration
@@ -119,35 +129,25 @@ The daemon stores all runtime state under `~/.local/share/sftpsync/`:
 
 ## Running as a service
 
-**launchd (macOS):**
+On macOS the install script handles this automatically — a LaunchAgent is registered so `sftpsyncd` starts at login.
 
-Create `~/Library/LaunchAgents/com.sftpsync.plist`:
+On Linux, create a systemd user service:
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.sftpsync</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/sftpsyncd</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/usr/local/var/log/sftpsync.log</string>
-    <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/sftpsync.log</string>
-</dict>
-</plist>
+```ini
+# ~/.config/systemd/user/sftpsyncd.service
+[Unit]
+Description=sftpsync daemon
+
+[Service]
+ExecStart=/usr/local/bin/sftpsyncd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
 ```
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.sftpsync.plist
+systemctl --user enable --now sftpsyncd
 ```
 
 ## Project structure
@@ -172,6 +172,5 @@ sftpsync/
 ## Roadmap
 
 - [ ] Structured logging
-- [ ] Mac menu bar UI (`github.com/getlantern/systray`)
 - [ ] Deletion sync (remove local files deleted on remote)
 - [ ] Hash-based change detection fallback (for servers with unreliable mtimes)
