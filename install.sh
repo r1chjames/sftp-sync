@@ -46,8 +46,15 @@ echo "Installing binaries to $INSTALL_DIR (may prompt for sudo)..."
 sudo install -m 755 "$TMP/sftpsyncd" "$INSTALL_DIR/sftpsyncd"
 sudo install -m 755 "$TMP/sftpsync"  "$INSTALL_DIR/sftpsync"
 
-# macOS-only: install LaunchAgent
+# macOS-only: install sftpsyncbar.app and LaunchAgent
 if [ "$OS" = "darwin" ]; then
+  echo "  Downloading sftpsyncbar..."
+  curl -fsSL "$BASE_URL/sftpsyncbar-darwin-${ARCH}.zip" -o "$TMP/sftpsyncbar.zip"
+  unzip -q "$TMP/sftpsyncbar.zip" -d "$TMP"
+  echo "Installing sftpsyncbar.app to /Applications (may prompt for sudo)..."
+  sudo rm -rf /Applications/sftpsyncbar.app
+  sudo cp -r "$TMP/sftpsyncbar.app" /Applications/sftpsyncbar.app
+  xattr -dr com.apple.quarantine /Applications/sftpsyncbar.app
   echo "Installing LaunchAgent..."
   mkdir -p "$PLIST_DIR"
   cat > "$PLIST_FILE" <<EOF
