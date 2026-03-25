@@ -22,8 +22,6 @@ jobs:
             goarch: amd64
           - goos: darwin
             goarch: arm64
-          - goos: windows
-            goarch: amd64
 
     steps:
       - uses: actions/checkout@v4
@@ -37,10 +35,8 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          ext=""
-          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-          go build -ldflags="-s -w" -o "sftpsyncd-${GOOS}-${GOARCH}${ext}" ./cmd/sftpsyncd
-          go build -ldflags="-s -w" -o "sftpsync-${GOOS}-${GOARCH}${ext}"  ./cmd/sftpsync
+          go build -ldflags="-s -w" -o "sftpsyncd-${GOOS}-${GOARCH}" ./cmd/sftpsyncd
+          go build -ldflags="-s -w" -o "sftpsync-${GOOS}-${GOARCH}"  ./cmd/sftpsync
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
