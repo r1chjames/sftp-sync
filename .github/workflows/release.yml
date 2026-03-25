@@ -38,6 +38,42 @@ jobs:
           go build -ldflags="-s -w" -o "sftpsyncd-${GOOS}-${GOARCH}" ./cmd/sftpsyncd
           go build -ldflags="-s -w" -o "sftpsync-${GOOS}-${GOARCH}"  ./cmd/sftpsync
 
+      - name: Build sftpsyncbar and package .app bundle (macOS only)
+        if: matrix.goos == 'darwin'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -ldflags="-s -w" -o sftpsyncbar-bin ./cmd/sftpsyncbar
+          mkdir -p sftpsyncbar.app/Contents/MacOS
+          mv sftpsyncbar-bin sftpsyncbar.app/Contents/MacOS/sftpsyncbar
+          cat > sftpsyncbar.app/Contents/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>sftpsyncbar</string>
+              <key>CFBundleDisplayName</key>
+              <string>sftpsyncbar</string>
+              <key>CFBundleExecutable</key>
+              <string>sftpsyncbar</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.r1chjames.sftpsyncbar</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>LSUIElement</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+          zip -r "sftpsyncbar-darwin-${GOARCH}.zip" sftpsyncbar.app
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -45,6 +81,7 @@ jobs:
           path: |
             sftpsyncd-*
             sftpsync-*
+            sftpsyncbar-*.zip
 
   release:
     needs: build
@@ -62,3 +99,4 @@ jobs:
           files: |
             sftpsyncd-*
             sftpsync-*
+            sftpsyncbar-*.zip
