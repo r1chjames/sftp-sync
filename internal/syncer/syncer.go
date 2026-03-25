@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -110,8 +111,21 @@ func (s *Syncer) sync(ctx context.Context) error {
 		}
 		entry, ok := s.manifest.Get(f.Path)
 		if !ok || !entry.MTime.Equal(f.MTime) || entry.Size != f.Size {
+			// For files not yet in the manifest, adopt them if they already
+			// exist locally rather than re-downloading.
+			if !ok {
+				if _, err := os.Stat(s.localPath(f.Path)); err == nil {
+					log.Printf("adopting existing local file: %s", f.Path)
+					s.manifest.Set(f.Path, state.Entry{MTime: f.MTime, Size: f.Size})
+					continue
+				}
+			}
 			toDownload = append(toDownload, f)
 		}
+	}
+
+	if err := s.manifest.Save(); err != nil {
+		log.Printf("warning: could not save manifest after adoption: %v", err)
 	}
 
 	if len(toDownload) > 0 {

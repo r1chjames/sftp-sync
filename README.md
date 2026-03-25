@@ -1,10 +1,12 @@
-# sftpSync
+# sftpsync
 
-A lightweight Go daemon that polls an SFTP server and syncs new or changed image files to a local directory.
+A lightweight Go daemon that manages multiple SFTP sync jobs, each with its own configuration. A companion CLI submits and controls jobs over a Unix socket.
 
 ## Features
 
-- Polls on a configurable interval (no SFTP push support required)
+- Multiple independent sync jobs, each targeting a different SFTP server or path
+- Jobs persist across daemon restarts
+- Polls on a configurable interval per job (no SFTP push support required)
 - Tracks remote file state via a local JSON manifest (mtime + size)
 - Concurrent downloads with a bounded goroutine pool
 - Atomic file writes (temp-file + rename — no partial files)
@@ -22,13 +24,38 @@ A lightweight Go daemon that polls an SFTP server and syncs new or changed image
 
 ```bash
 git clone <repo>
-cd sftpSync
-go build -o sftpsync ./cmd/sftpsync
+cd sftpsync
+go build -o sftpsyncd ./cmd/sftpsyncd   # daemon
+go build -o sftpsync  ./cmd/sftpsync    # CLI client
+```
+
+## Quick start
+
+Start the daemon (runs in the foreground):
+
+```bash
+./sftpsyncd
+```
+
+Submit a sync job using a config file:
+
+```bash
+./sftpsync add /path/to/config.yaml
+```
+
+List and manage jobs:
+
+```bash
+./sftpsync list
+./sftpsync status
+./sftpsync status <id>
+./sftpsync remove <id>
+./sftpsync stop       # shut down the daemon
 ```
 
 ## Configuration
 
-Copy the example config and edit it:
+Each job is configured via its own YAML file. Copy the example and edit it:
 
 ```bash
 cp config.yaml.example config.yaml
@@ -55,6 +82,8 @@ sync:
     - .raw
 ```
 
+You can have as many config files as you like — one per SFTP source — and submit them all to the same running daemon.
+
 ### Authentication
 
 The following methods are tried in order:
@@ -78,20 +107,15 @@ sftp:
   insecure_ignore_host_key: true
 ```
 
-## Usage
+## Data directory
 
-```bash
-./sftpsync -config config.yaml
-```
+The daemon stores all runtime state under `~/.local/share/sftpsync/`:
 
-The daemon runs until interrupted. On each poll it:
-
-1. Connects to the SFTP server (reconnects automatically if the connection drops)
-2. Walks the remote path recursively
-3. Downloads any files that are new or have changed (different mtime or size)
-4. Updates the local manifest
-
-Manifest location defaults to `~/.local/share/sftpsync/manifest.json` and can be overridden with `state_path` in the config.
+| Path | Contents |
+|------|----------|
+| `registry.json` | Persisted list of jobs (restored on startup) |
+| `jobs/<id>.json` | Per-job sync manifest |
+| `daemon.sock` | Unix socket (present only while daemon is running) |
 
 ## Running as a service
 
@@ -108,9 +132,7 @@ Create `~/Library/LaunchAgents/com.sftpsync.plist`:
     <string>com.sftpsync</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/sftpsync</string>
-        <string>-config</string>
-        <string>/Users/you/.config/sftpsync/config.yaml</string>
+        <string>/usr/local/bin/sftpsyncd</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -128,46 +150,27 @@ Create `~/Library/LaunchAgents/com.sftpsync.plist`:
 launchctl load ~/Library/LaunchAgents/com.sftpsync.plist
 ```
 
-**Docker:**
-
-```dockerfile
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN go build -o sftpsync ./cmd/sftpsync
-
-FROM alpine:latest
-RUN apk add --no-cache ca-certificates
-WORKDIR /app
-COPY --from=builder /app/sftpsync .
-ENTRYPOINT ["./sftpsync", "-config", "/config/config.yaml"]
-```
-
-```bash
-docker build -t sftpsync .
-docker run -d \
-  -v /path/to/config.yaml:/config/config.yaml \
-  -v /path/to/photos:/photos \
-  sftpsync
-```
-
 ## Project structure
 
 ```
-sftpSync/
-├── cmd/sftpsync/main.go          # entrypoint, signal handling
+sftpsync/
+├── cmd/
+│   ├── sftpsyncd/main.go         # daemon binary
+│   └── sftpsync/main.go          # CLI client binary
 ├── internal/
 │   ├── config/config.go          # YAML config loading and validation
+│   ├── daemon/
+│   │   ├── daemon.go             # job registry, lifecycle management
+│   │   ├── api.go                # HTTP API over Unix socket
+│   │   └── job.go                # Job type and JSON response types
 │   ├── sftp/client.go            # SSH/SFTP connection, walk, download
-│   ├── state/manifest.go         # local sync state (JSON)
+│   ├── state/manifest.go         # per-job sync state (JSON)
 │   └── syncer/syncer.go          # poll loop, diff logic, worker pool
-├── config.yaml.example
-└── PLAN.md                       # architecture and roadmap
+└── config.yaml.example
 ```
 
 ## Roadmap
 
-- [ ] Docker support (`Dockerfile`)
 - [ ] Structured logging
 - [ ] Mac menu bar UI (`github.com/getlantern/systray`)
 - [ ] Deletion sync (remove local files deleted on remote)
