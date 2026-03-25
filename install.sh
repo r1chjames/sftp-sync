@@ -54,7 +54,7 @@ if [ "$OS" = "darwin" ]; then
   echo "Installing sftpsyncbar.app to /Applications (may prompt for sudo)..."
   sudo rm -rf /Applications/sftpsyncbar.app
   sudo cp -r "$TMP/sftpsyncbar.app" /Applications/sftpsyncbar.app
-  xattr -dr com.apple.quarantine /Applications/sftpsyncbar.app
+  sudo xattr -dr com.apple.quarantine /Applications/sftpsyncbar.app
   echo "Installing LaunchAgent..."
   mkdir -p "$PLIST_DIR"
   cat > "$PLIST_FILE" <<EOF
@@ -80,6 +80,7 @@ if [ "$OS" = "darwin" ]; then
 </dict>
 </plist>
 EOF
+  launchctl bootout "gui/$(id -u)" "$PLIST_FILE" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE"
   echo ""
   echo "Done. sftpsyncd $VERSION is running and will start at login."
