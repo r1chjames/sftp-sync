@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/r1chjames/sftp-sync/internal/config"
+	"github.com/r1chjames/sftp-sync/internal/exif"
 	sftpclient "github.com/r1chjames/sftp-sync/internal/sftp"
 	"github.com/r1chjames/sftp-sync/internal/state"
 )
@@ -166,9 +167,45 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			localPath := s.localPath(f.Path)
-			err := s.client.Download(f.Path, localPath)
-			results <- result{file: f, err: err}
+			// Stage the download to a temp file so we can inspect it.
+			tmpPath, err := s.client.DownloadTemp(f.Path, s.cfg.LocalPath)
+			if err != nil {
+				results <- result{file: f, err: err}
+				return
+			}
+
+			// Try to extract the capture date from EXIF metadata.
+			captureDate, exifErr := exif.Date(tmpPath)
+			var finalPath string
+			if exifErr == nil {
+				finalPath = s.datePath(f.Path, captureDate)
+			} else {
+				finalPath = s.localPath(f.Path)
+			}
+
+			// Ensure destination directory exists, then place the file.
+			if err := os.MkdirAll(filepath.Dir(finalPath), 0755); err != nil {
+				os.Remove(tmpPath)
+				results <- result{file: f, err: fmt.Errorf("mkdir: %w", err)}
+				return
+			}
+
+			if err := os.Rename(tmpPath, finalPath); err != nil {
+				os.Remove(tmpPath)
+				results <- result{file: f, err: fmt.Errorf("rename: %w", err)}
+				return
+			}
+
+			// Set the file modification time to the capture date when available.
+			mtime := f.MTime
+			if exifErr == nil {
+				mtime = captureDate
+			}
+			if err := os.Chtimes(finalPath, mtime, mtime); err != nil {
+				log.Printf("warning: could not set file times for %s: %v", finalPath, err)
+			}
+
+			results <- result{file: f, err: nil}
 		}(f)
 	}
 
@@ -197,6 +234,23 @@ func (s *Syncer) localPath(remotePath string) string {
 	rel := strings.TrimPrefix(remotePath, s.cfg.SFTP.RemotePath)
 	rel = strings.TrimPrefix(rel, "/")
 	return filepath.Join(s.cfg.LocalPath, filepath.FromSlash(rel))
+}
+
+// datePath returns the local destination path derived from a capture date,
+// organised according to the configured folder_structure. The filename is
+// preserved from the original remote path.
+func (s *Syncer) datePath(remotePath string, date time.Time) string {
+	name := filepath.Base(remotePath)
+	switch s.cfg.Sync.FolderStructure {
+	case "year":
+		return filepath.Join(s.cfg.LocalPath, date.Format("2006"), name)
+	case "year_month":
+		return filepath.Join(s.cfg.LocalPath, date.Format("2006"), date.Format("01"), name)
+	case "year_month_day":
+		return filepath.Join(s.cfg.LocalPath, date.Format("2006"), date.Format("01"), date.Format("02"), name)
+	default:
+		return s.localPath(remotePath)
+	}
 }
 
 func (s *Syncer) matchesFilter(path string) bool {

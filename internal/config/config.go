@@ -19,9 +19,10 @@ type SFTPConfig struct {
 }
 
 type SyncConfig struct {
-	Interval   time.Duration `yaml:"interval"`
-	Workers    int           `yaml:"workers"`
-	Extensions []string      `yaml:"extensions"`
+	Interval        time.Duration `yaml:"interval"`
+	Workers         int           `yaml:"workers"`
+	Extensions      []string      `yaml:"extensions"`
+	FolderStructure string        `yaml:"folder_structure"` // "none", "year", "year_month", or "year_month_day"
 }
 
 type Config struct {
@@ -75,6 +76,14 @@ func (c *Config) validate() error {
 	}
 	if c.Sync.Workers <= 0 {
 		c.Sync.Workers = 4
+	}
+	if c.Sync.FolderStructure == "" {
+		c.Sync.FolderStructure = "none"
+	}
+	switch c.Sync.FolderStructure {
+	case "none", "year", "year_month", "year_month_day":
+	default:
+		return fmt.Errorf("sync.folder_structure must be one of: none, year, year_month, year_month_day")
 	}
 	return nil
 }

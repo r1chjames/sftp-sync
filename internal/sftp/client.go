@@ -128,28 +128,45 @@ func (c *Client) Download(remotePath, localPath string) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
+	tmpPath, err := c.DownloadTemp(remotePath, filepath.Dir(localPath))
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpPath)
+
+	return os.Rename(tmpPath, localPath)
+}
+
+// DownloadTemp downloads a remote file into stagingDir and returns the path to
+// the temp file. The caller is responsible for removing or renaming the file.
+func (c *Client) DownloadTemp(remotePath, stagingDir string) (string, error) {
 	src, err := c.sftpc.Open(remotePath)
 	if err != nil {
-		return fmt.Errorf("open remote: %w", err)
+		return "", fmt.Errorf("open remote: %w", err)
 	}
 	defer src.Close()
 
-	dst, err := os.CreateTemp(filepath.Dir(localPath), ".sftpsync-*")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
+	if err := os.MkdirAll(stagingDir, 0755); err != nil {
+		return "", fmt.Errorf("mkdir: %w", err)
 	}
-	tmpPath := dst.Name()
-	defer func() {
-		dst.Close()
-		os.Remove(tmpPath) // no-op if already renamed
-	}()
+
+	dst, err := os.CreateTemp(stagingDir, ".sftpsync-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp: %w", err)
+	}
+	defer dst.Close()
 
 	if _, err := io.Copy(dst, src); err != nil {
-		return fmt.Errorf("copy: %w", err)
+		os.Remove(dst.Name())
+		return "", fmt.Errorf("copy: %w", err)
 	}
-	dst.Close()
 
-	return os.Rename(tmpPath, localPath)
+	if err := dst.Close(); err != nil {
+		os.Remove(dst.Name())
+		return "", fmt.Errorf("close temp: %w", err)
+	}
+
+	return dst.Name(), nil
 }
 
 func (c *Client) authMethods() ([]ssh.AuthMethod, error) {

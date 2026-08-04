@@ -31,6 +31,16 @@ sync:
     - .heic
     - .tiff
 
+  # How to organise synced photos into local folders.
+  # - "none":            preserve the remote directory structure (default)
+  # - "year":            YYYY/<filename>     e.g. ~/Pictures/2024/IMG_1234.jpg
+  # - "year_month":      YYYY/MM/<filename>  e.g. ~/Pictures/2024/06/IMG_1234.jpg
+  # - "year_month_day":  YYYY/MM/DD/<filename>  e.g. ~/Pictures/2024/06/15/IMG_1234.jpg
+  #
+  # The date is taken from EXIF DateTimeOriginal when available, falling back
+  # to the remote directory structure when EXIF data cannot be read.
+  folder_structure: year_month
+
 # Path for the state manifest (tracks what has been synced).
 # Defaults to ~/.local/share/sftpsync/manifest.json
 # state_path: ~/.local/share/sftpsync/manifest.json
