@@ -26,3 +26,32 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sftpsyncbar:
+    needs: goreleaser
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build sftpsyncbar (arm64)
+        env:
+          CGO_ENABLED: 1
+        run: go build -ldflags="-s -w" -o sftpsyncbar-bin ./cmd/sftpsyncbar
+
+      - name: Package .app bundle (arm64)
+        run: |
+          mkdir -p sftpsyncbar.app/Contents/MacOS
+          mv sftpsyncbar-bin sftpsyncbar.app/Contents/MacOS/sftpsyncbar
+          cp cmd/sftpsyncbar/Info.plist sftpsyncbar.app/Contents/Info.plist
+          zip -r sftpsyncbar-darwin-arm64.zip sftpsyncbar.app
+
+      - name: Upload to release
+        run: gh release upload ${{ github.ref_name }} sftpsyncbar-darwin-arm64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
