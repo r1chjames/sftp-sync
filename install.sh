@@ -30,16 +30,18 @@ if [ -z "$VERSION" ]; then
 fi
 echo "Installing $VERSION ($OS/$ARCH)..."
 
-# Download binaries
+# Download and extract archive
 BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-for BIN in sftpsyncd sftpsync; do
-  echo "  Downloading $BIN..."
-  curl -fsSL "$BASE_URL/${BIN}-${OS}-${ARCH}" -o "$TMP/$BIN"
-  chmod +x "$TMP/$BIN"
-done
+# GoReleaser strips the 'v' prefix from the archive name
+SEMVER="${VERSION#v}"
+ARCHIVE="sftp-sync_${SEMVER}_${OS}_${ARCH}.tar.gz"
+echo "  Downloading $ARCHIVE..."
+curl -fsSL "$BASE_URL/$ARCHIVE" -o "$TMP/$ARCHIVE"
+tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
+chmod +x "$TMP/sftpsyncd" "$TMP/sftpsync"
 
 # Install binaries
 echo "Installing binaries to $INSTALL_DIR (may prompt for sudo)..."
