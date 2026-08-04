@@ -1,0 +1,44 @@
+version: 2
+
+builds:
+  - id: sftpsyncd
+    main: ./cmd/sftpsyncd
+    binary: sftpsyncd
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+  - id: sftpsync
+    main: ./cmd/sftpsync
+    binary: sftpsync
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: default
+    formats: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+release:
+  github:
+    owner: r1chjames
+    name: sftp-sync
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
