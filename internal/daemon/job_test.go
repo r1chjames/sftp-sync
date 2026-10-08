@@ -18,15 +18,19 @@ type stubJobSyncer struct {
 func (s *stubJobSyncer) Status() syncer.SyncStatus { return s.status }
 func (s *stubJobSyncer) Stop()                     { s.actions = append(s.actions, "stop") }
 
+func (s *stubJobSyncer) IsPaused() bool { return s.status.Paused }
+
 func (s *stubJobSyncer) SyncNow() { s.actions = append(s.actions, "sync") }
 
 func (s *stubJobSyncer) Pause() {
 	s.actions = append(s.actions, "pause")
+	s.status.Paused = true
 	s.status.Phase = syncer.PhasePaused
 }
 
 func (s *stubJobSyncer) Resume() {
 	s.actions = append(s.actions, "resume")
+	s.status.Paused = false
 	s.status.Phase = syncer.PhaseScanning
 }
 

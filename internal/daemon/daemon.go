@@ -152,6 +152,36 @@ type registryEntry struct {
 	ID         string    `json:"id"`
 	ConfigPath string    `json:"config_path"`
 	AddedAt    time.Time `json:"added_at"`
+
+	// Paused is omitted when false, so registries written by earlier versions
+	// remain byte-compatible and an absent field reads as not paused.
+	Paused bool `json:"paused,omitempty"`
+}
+
+// newRegistryEntries renders jobs in their persisted form, in the same stable
+// order used by the API.
+func newRegistryEntries(jobs []*Job) []registryEntry {
+	sorted := sortJobs(jobs)
+	entries := make([]registryEntry, 0, len(sorted))
+	for _, j := range sorted {
+		entries = append(entries, registryEntry{
+			ID:         j.ID,
+			ConfigPath: j.ConfigPath,
+			AddedAt:    j.AddedAt,
+			Paused:     j.syncer != nil && j.syncer.IsPaused(),
+		})
+	}
+	return entries
+}
+
+// parseRegistry decodes a registry file. An absent paused field leaves the job
+// active, so registries written before pause existed still load.
+func parseRegistry(data []byte) (registryFile, error) {
+	var reg registryFile
+	if err := json.Unmarshal(data, &reg); err != nil {
+		return registryFile{}, fmt.Errorf("parse registry: %w", err)
+	}
+	return reg, nil
 }
 
 func (d *Daemon) loadRegistry() error {
@@ -163,9 +193,9 @@ func (d *Daemon) loadRegistry() error {
 		return fmt.Errorf("read registry: %w", err)
 	}
 
-	var reg registryFile
-	if err := json.Unmarshal(data, &reg); err != nil {
-		return fmt.Errorf("parse registry: %w", err)
+	reg, err := parseRegistry(data)
+	if err != nil {
+		return err
 	}
 
 	for _, entry := range reg.Jobs {
@@ -177,6 +207,12 @@ func (d *Daemon) loadRegistry() error {
 		cfg.StatePath = config.ExpandHome(dataDir + "/jobs/" + entry.ID + ".json")
 
 		s := syncer.New(cfg)
+		if entry.Paused {
+			// Pause before Start so the run loop's first gate check already
+			// sees the paused state. Pausing after Start would race the
+			// startup cycle and could open an SFTP connection.
+			s.Pause()
+		}
 		if err := s.Start(d.ctx); err != nil {
 			log.Printf("skipping job %s: start: %v", entry.ID, err)
 			continue
@@ -201,14 +237,7 @@ func (d *Daemon) saveRegistry() error {
 	}
 	d.mu.RUnlock()
 
-	var reg registryFile
-	for _, j := range sortJobs(jobs) {
-		reg.Jobs = append(reg.Jobs, registryEntry{
-			ID:         j.ID,
-			ConfigPath: j.ConfigPath,
-			AddedAt:    j.AddedAt,
-		})
-	}
+	reg := registryFile{Jobs: newRegistryEntries(jobs)}
 
 	if err := os.MkdirAll(filepath.Dir(d.registryPath), 0755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)

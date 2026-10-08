@@ -78,6 +78,11 @@ if the job is unknown. Pausing and resuming are idempotent, and pausing does
 not abort work already in flight: files being copied are committed atomically,
 and files not yet started are picked up on resume.
 
+Paused state is stored in the registry, so a paused job stays paused across a
+daemon restart and never reconnects until it is resumed. If that state cannot
+be written, the request fails and the job's runtime state is rolled back rather
+than reported as persisted.
+
 The Unix socket (mode `0600`) is the only trust boundary — the daemon does not
 listen on TCP.
 
