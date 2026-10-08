@@ -8,12 +8,27 @@ import (
 	"github.com/r1chjames/sftp-sync/internal/syncer"
 )
 
+// stubJobSyncer records control actions and lets tests publish an arbitrary
+// status, so handlers can be exercised without SFTP.
 type stubJobSyncer struct {
-	status syncer.SyncStatus
+	status  syncer.SyncStatus
+	actions []string
 }
 
-func (s stubJobSyncer) Status() syncer.SyncStatus { return s.status }
-func (stubJobSyncer) Stop()                       {}
+func (s *stubJobSyncer) Status() syncer.SyncStatus { return s.status }
+func (s *stubJobSyncer) Stop()                     { s.actions = append(s.actions, "stop") }
+
+func (s *stubJobSyncer) SyncNow() { s.actions = append(s.actions, "sync") }
+
+func (s *stubJobSyncer) Pause() {
+	s.actions = append(s.actions, "pause")
+	s.status.Phase = syncer.PhasePaused
+}
+
+func (s *stubJobSyncer) Resume() {
+	s.actions = append(s.actions, "resume")
+	s.status.Phase = syncer.PhaseScanning
+}
 
 func TestJobToResponseWithoutLastError(t *testing.T) {
 	addedAt := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -21,7 +36,7 @@ func TestJobToResponseWithoutLastError(t *testing.T) {
 		ID:         "abc12345",
 		ConfigPath: "/tmp/photos.yaml",
 		AddedAt:    addedAt,
-		syncer: stubJobSyncer{status: syncer.SyncStatus{
+		syncer: &stubJobSyncer{status: syncer.SyncStatus{
 			Phase:         syncer.PhaseIdle,
 			FilesTotal:    12,
 			EligibleFiles: 12,
@@ -45,7 +60,7 @@ func TestJobToResponseConvertsLastErrorAtBoundary(t *testing.T) {
 	lastSuccess := startedAt.Add(-time.Hour)
 	job := &Job{
 		ID: "abc12345",
-		syncer: stubJobSyncer{status: syncer.SyncStatus{
+		syncer: &stubJobSyncer{status: syncer.SyncStatus{
 			Phase:              syncer.PhaseError,
 			LastSuccessfulSync: lastSuccess,
 			BatchTotal:         3,

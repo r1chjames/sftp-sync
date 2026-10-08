@@ -52,8 +52,49 @@ func (d *Daemon) newMux() *http.ServeMux {
 	mux.HandleFunc("POST /jobs", d.handleAddJob)
 	mux.HandleFunc("GET /jobs/{id}", d.handleGetJob)
 	mux.HandleFunc("DELETE /jobs/{id}", d.handleRemoveJob)
+	mux.HandleFunc("POST /jobs/{id}/sync", d.handleSyncJob)
+	mux.HandleFunc("POST /jobs/{id}/pause", d.handlePauseJob)
+	mux.HandleFunc("POST /jobs/{id}/resume", d.handleResumeJob)
 	mux.HandleFunc("POST /shutdown", d.handleShutdown)
 	return mux
+}
+
+func (d *Daemon) handleSyncJob(w http.ResponseWriter, r *http.Request) {
+	d.jobControl(w, r, "sync")
+}
+
+func (d *Daemon) handlePauseJob(w http.ResponseWriter, r *http.Request) {
+	d.jobControl(w, r, "pause")
+}
+
+func (d *Daemon) handleResumeJob(w http.ResponseWriter, r *http.Request) {
+	d.jobControl(w, r, "resume")
+}
+
+// jobControl applies an asynchronous control action to the job named in the
+// path and returns the job's status after the request was accepted. The action
+// is applied only to the selected job; unknown jobs are reported as missing.
+func (d *Daemon) jobControl(w http.ResponseWriter, r *http.Request, action string) {
+	id := r.PathValue("id")
+	job, ok := d.GetJob(id)
+	if !ok {
+		http.Error(w, fmt.Sprintf("job %s not found", id), http.StatusNotFound)
+		return
+	}
+
+	switch action {
+	case "sync":
+		job.syncer.SyncNow()
+	case "pause":
+		job.syncer.Pause()
+	case "resume":
+		job.syncer.Resume()
+	default:
+		http.Error(w, "unsupported action: "+action, http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, job.toResponse())
 }
 
 func (d *Daemon) handleListJobs(w http.ResponseWriter, r *http.Request) {

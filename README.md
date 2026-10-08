@@ -63,6 +63,24 @@ sftpsync remove <id>
 sftpsync stop       # shut down the daemon
 ```
 
+### Job controls
+
+The daemon accepts per-job control requests over the same Unix socket:
+
+```text
+POST /jobs/{id}/sync     # scan and download now instead of waiting for the interval
+POST /jobs/{id}/pause    # stop starting new scans and downloads
+POST /jobs/{id}/resume   # clear the paused state and scan immediately
+```
+
+Each returns `202 Accepted` with the job's updated status, or `404 Not Found`
+if the job is unknown. Pausing and resuming are idempotent, and pausing does
+not abort work already in flight: files being copied are committed atomically,
+and files not yet started are picked up on resume.
+
+The Unix socket (mode `0600`) is the only trust boundary — the daemon does not
+listen on TCP.
+
 ## Configuration
 
 Each job is configured via its own YAML file. Copy the example and edit it:

@@ -19,7 +19,7 @@ func testJob(id string, addedAt time.Time, status syncer.SyncStatus) *Job {
 		ID:         id,
 		ConfigPath: "/tmp/" + id + ".yaml",
 		AddedAt:    addedAt,
-		syncer:     stubJobSyncer{status: status},
+		syncer:     &stubJobSyncer{status: status},
 	}
 }
 
@@ -282,6 +282,121 @@ func TestAddJobRejectsInvalidRequests(t *testing.T) {
 				t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusBadRequest, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestJobControlEndpoints(t *testing.T) {
+	tests := []struct {
+		name       string
+		action     string
+		wantAction string
+		wantPhase  string
+	}{
+		{name: "sync", action: "sync", wantAction: "sync", wantPhase: "idle"},
+		{name: "pause", action: "pause", wantAction: "pause", wantPhase: "paused"},
+		{name: "resume", action: "resume", wantAction: "resume", wantPhase: "scanning"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &stubJobSyncer{status: syncer.SyncStatus{Phase: syncer.PhaseIdle}}
+			job := testJob("abc12345", time.Now(), syncer.SyncStatus{})
+			job.syncer = stub
+			d := newTestDaemon(t, job)
+
+			rec := serve(t, d, http.MethodPost, "/jobs/abc12345/"+tt.action, "")
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusAccepted, rec.Body.String())
+			}
+
+			var got JobResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got.Status.Phase != tt.wantPhase {
+				t.Fatalf("phase = %q, want %q", got.Status.Phase, tt.wantPhase)
+			}
+			if len(stub.actions) != 1 || stub.actions[0] != tt.wantAction {
+				t.Fatalf("actions = %v, want one %q", stub.actions, tt.wantAction)
+			}
+		})
+	}
+}
+
+func TestJobControlRepeatedCallsSucceed(t *testing.T) {
+	stub := &stubJobSyncer{status: syncer.SyncStatus{Phase: syncer.PhaseIdle}}
+	job := testJob("abc12345", time.Now(), syncer.SyncStatus{})
+	job.syncer = stub
+	d := newTestDaemon(t, job)
+
+	for i := 0; i < 3; i++ {
+		rec := serve(t, d, http.MethodPost, "/jobs/abc12345/pause", "")
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("pause %d status = %d, want %d", i, rec.Code, http.StatusAccepted)
+		}
+		rec = serve(t, d, http.MethodPost, "/jobs/abc12345/resume", "")
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("resume %d status = %d, want %d", i, rec.Code, http.StatusAccepted)
+		}
+	}
+
+	if got := strings.Join(stub.actions, ","); got != "pause,resume,pause,resume,pause,resume" {
+		t.Fatalf("actions = %s", got)
+	}
+}
+
+func TestJobControlUnknownJob(t *testing.T) {
+	d := newTestDaemon(t, testJob("abc12345", time.Now(), syncer.SyncStatus{}))
+
+	for _, action := range []string{"sync", "pause", "resume"} {
+		t.Run(action, func(t *testing.T) {
+			rec := serve(t, d, http.MethodPost, "/jobs/missing1/"+action, "")
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+			}
+			if !strings.Contains(rec.Body.String(), "missing1") {
+				t.Fatalf("body = %q, want the job ID", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestJobControlAffectsOnlyTheSelectedJob(t *testing.T) {
+	first := &stubJobSyncer{status: syncer.SyncStatus{Phase: syncer.PhaseIdle}}
+	second := &stubJobSyncer{status: syncer.SyncStatus{Phase: syncer.PhaseIdle}}
+	jobA := testJob("aaaaaaaa", time.Now(), syncer.SyncStatus{})
+	jobA.syncer = first
+	jobB := testJob("bbbbbbbb", time.Now(), syncer.SyncStatus{})
+	jobB.syncer = second
+	d := newTestDaemon(t, jobA, jobB)
+
+	rec := serve(t, d, http.MethodPost, "/jobs/aaaaaaaa/pause", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+
+	if len(first.actions) != 1 || first.actions[0] != "pause" {
+		t.Fatalf("selected job actions = %v, want one pause", first.actions)
+	}
+	if len(second.actions) != 0 {
+		t.Fatalf("other job was affected: %v", second.actions)
+	}
+
+	jobs := decodeList(t, serve(t, d, http.MethodGet, "/jobs", ""))
+	byID := map[string]string{}
+	for _, j := range jobs {
+		byID[j.ID] = j.Status.Phase
+	}
+	if byID["aaaaaaaa"] != "paused" || byID["bbbbbbbb"] != "idle" {
+		t.Fatalf("phases = %v, want aaaaaaaa paused and bbbbbbbb idle", byID)
+	}
+}
+
+func TestJobControlRejectsWrongMethod(t *testing.T) {
+	d := newTestDaemon(t, testJob("abc12345", time.Now(), syncer.SyncStatus{}))
+	rec := serve(t, d, http.MethodGet, "/jobs/abc12345/pause", "")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
 	}
 }
 

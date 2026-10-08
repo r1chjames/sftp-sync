@@ -96,6 +96,45 @@ func (c *Client) AddJob(configPath string) (daemon.JobResponse, error) {
 	return job, nil
 }
 
+// SyncJob asks the daemon to scan and download now instead of waiting for the
+// next interval tick.
+func (c *Client) SyncJob(id string) (daemon.JobResponse, error) {
+	return c.jobAction(id, "sync")
+}
+
+// PauseJob stops the job from starting new scans and downloads.
+func (c *Client) PauseJob(id string) (daemon.JobResponse, error) {
+	return c.jobAction(id, "pause")
+}
+
+// ResumeJob clears the paused state and triggers an immediate scan.
+func (c *Client) ResumeJob(id string) (daemon.JobResponse, error) {
+	return c.jobAction(id, "resume")
+}
+
+// jobAction posts an asynchronous control action and returns the job status
+// accepted by the daemon.
+func (c *Client) jobAction(id, action string) (daemon.JobResponse, error) {
+	resp, err := c.http.Post(c.baseURL+"/jobs/"+id+"/"+action, "", nil)
+	if err != nil {
+		return daemon.JobResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return daemon.JobResponse{}, fmt.Errorf("job %s not found", id)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		return daemon.JobResponse{}, responseError(resp)
+	}
+
+	var job daemon.JobResponse
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		return daemon.JobResponse{}, fmt.Errorf("decode: %w", err)
+	}
+	return job, nil
+}
+
 func (c *Client) RemoveJob(id string) error {
 	req, err := http.NewRequest(http.MethodDelete, c.baseURL+"/jobs/"+id, nil)
 	if err != nil {
