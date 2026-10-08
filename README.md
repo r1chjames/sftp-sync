@@ -151,9 +151,39 @@ sync:
 
   # Attempts per file before it is reported as failed.
   max_attempts: 3
+
+  # size (default) or sha256 verification.
+  verify: size
 ```
 
 You can have as many config files as you like — one per SFTP source — and submit them all to the same running daemon.
+
+### Verifying files
+
+A file is considered synced from the manifest's modification time and size. When a
+file is on disk but *not* in the manifest — a manifest lost or hand-edited, an
+interrupted write, a file copied there by hand — the daemon adopts it instead of
+downloading it again, but only when its **size matches the remote file**. A
+zero-byte or truncated local file is therefore downloaded properly instead of
+being recorded as a photo that was synced successfully.
+
+`verify: sha256` compares content hashes instead of trusting a size:
+
+- Adoption hashes both files and adopts only when they match. This catches a
+different file of the same length, which a size check cannot.
+- A download is hashed and compared with the server's copy before it is moved into
+  place, so a corrupted transfer never reaches the destination. A mismatch is
+  treated as a retryable transfer failure.
+- The verified digest is stored in the manifest. In `size` mode no digest is
+  stored, and the manifest is byte-identical to one written before this option
+  existed.
+
+Hashing streams the file and stops when the daemon shuts down or the job is
+stopped. It is off by default because it reads the remote file back, which doubles
+the transfer for every verified file. If the server refuses to re-read a file, the
+warning is logged and the file is kept without a digest rather than being
+discarded — a file that transferred successfully should not be thrown away
+because it could not be checked afterwards.
 
 ### Failures and retries
 

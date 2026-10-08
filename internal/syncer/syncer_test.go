@@ -400,7 +400,7 @@ func TestSelectForDownloadCountsFilteredAndAdoptedFiles(t *testing.T) {
 		{Path: "/photos/ignored.raw", MTime: mtime, Size: 30},
 	}
 
-	eligible, downloads := s.selectForDownload(files)
+	eligible, downloads := s.selectForDownload(context.Background(), files)
 	if eligible != 3 {
 		t.Fatalf("eligible = %d, want 3", eligible)
 	}

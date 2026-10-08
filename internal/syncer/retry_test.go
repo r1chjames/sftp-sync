@@ -223,6 +223,7 @@ func TestTransientClassification(t *testing.T) {
 		{name: "net op error", err: &net.OpError{Op: "read", Err: errors.New("reset by peer")}, want: true},
 		{name: "sftp connection lost", err: sftp.ErrSSHFxConnectionLost, want: true},
 		{name: "wrapped transient", err: wrap("open remote", io.ErrUnexpectedEOF), want: true},
+		{name: "checksum mismatch", err: errChecksumMismatch, want: true},
 
 		{name: "permission denied", err: syscall.EACCES, want: false},
 		{name: "no such file", err: syscall.ENOENT, want: false},

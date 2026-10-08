@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"github.com/r1chjames/sftp-sync/internal/config"
+	"github.com/r1chjames/sftp-sync/internal/verify"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -178,6 +180,24 @@ func (c *Client) closeLocked() {
 		c.conn = nil
 	}
 	c.stale = false
+}
+
+// HashRemote streams a remote file and returns its SHA-256 digest in
+// lower-case hex. It is how a transfer or an adopted file is checked against
+// what the server is actually offering, and it reads the whole file.
+func (c *Client) HashRemote(ctx context.Context, remotePath string) (string, error) {
+	client, err := c.ready()
+	if err != nil {
+		return "", err
+	}
+
+	src, err := client.Open(remotePath)
+	if err != nil {
+		return "", fmt.Errorf("open remote: %w", err)
+	}
+	defer src.Close()
+
+	return verify.SHA256Stream(ctx, src)
 }
 
 // Walk returns all regular files under remotePath recursively.
