@@ -165,17 +165,28 @@ func (s *Syncer) markFailure(err error) {
 	s.status.LastError = err
 }
 
+// recordCycle applies the outcome of a single sync cycle to the status
+// snapshot. A cycle cancelled by shutdown is not recorded as a failure:
+// recording one would report an error for a job that was working correctly
+// when the daemon was asked to stop.
+func (s *Syncer) recordCycle(ctx context.Context, err error) {
+	switch {
+	case err == nil:
+		s.markSuccess()
+	case ctx.Err() != nil:
+		log.Printf("sync interrupted: %v", err)
+	default:
+		log.Printf("sync error: %v", err)
+		s.markFailure(err)
+	}
+}
+
 func (s *Syncer) run(ctx context.Context) {
 	defer close(s.done)
 
 	// Run immediately on startup, then on each interval tick.
 	for {
-		if err := s.sync(ctx); err != nil {
-			log.Printf("sync error: %v", err)
-			s.markFailure(err)
-		} else {
-			s.markSuccess()
-		}
+		s.recordCycle(ctx, s.sync(ctx))
 
 		select {
 		case <-ctx.Done():
@@ -254,11 +265,13 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 	sem := make(chan struct{}, s.cfg.Sync.Workers)
 	var wg sync.WaitGroup
 
+	attempted := 0
 	for _, f := range files {
 		if ctx.Err() != nil {
 			break
 		}
 
+		attempted++
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(f sftpclient.RemoteFile) {
@@ -345,10 +358,17 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 	if err := downloadBatchError(failed, len(files), firstFailure.file.Path, firstFailure.err); err != nil {
 		return err
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+	return batchInterruptedError(attempted, len(files), ctx.Err())
+}
+
+// batchInterruptedError reports a batch that could not be attempted in full
+// because the context was cancelled. A batch that attempted every file is not
+// an error even when cancellation arrives while the last worker finishes.
+func batchInterruptedError(attempted, total int, ctxErr error) error {
+	if ctxErr == nil || attempted >= total {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("batch interrupted: %d of %d file(s) not attempted: %w", total-attempted, total, ctxErr)
 }
 
 func downloadBatchError(failed, total int, firstPath string, firstErr error) error {
