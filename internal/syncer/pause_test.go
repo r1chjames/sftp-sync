@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -163,6 +164,53 @@ func TestSyncNowWhilePausedRunsAfterResume(t *testing.T) {
 	assertNoSignal(t, entered, 300*time.Millisecond, "more than one cycle from buffered requests")
 
 	s.Stop()
+}
+
+func TestStartWhilePausedRunsNoCycle(t *testing.T) {
+	s := testSyncer(t, time.Hour)
+	var cycles int32
+	s.syncFn = func(context.Context) error {
+		atomic.AddInt32(&cycles, 1)
+		return nil
+	}
+
+	// A restored paused job is paused before Start, so the loop's first gate
+	// check already sees the paused state and never opens a connection.
+	s.Pause()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	waitForPhase(t, s, PhasePaused)
+	time.Sleep(150 * time.Millisecond)
+	if got := atomic.LoadInt32(&cycles); got != 0 {
+		t.Fatalf("cycles = %d, want 0 while restored paused", got)
+	}
+	if st := s.Status(); !st.Paused || st.Phase != PhasePaused {
+		t.Fatalf("status = %+v, want paused", st)
+	}
+
+	s.Stop()
+}
+
+func TestPausedFlagIsPublishedInStatus(t *testing.T) {
+	s := testSyncer(t, time.Hour)
+	if s.Status().Paused {
+		t.Fatal("a new syncer must not report paused")
+	}
+
+	s.Pause()
+	if !s.Status().Paused {
+		t.Fatal("status.Paused = false after Pause")
+	}
+
+	s.Resume()
+	if s.Status().Paused {
+		t.Fatal("status.Paused = true after Resume")
+	}
 }
 
 func TestStopWhilePaused(t *testing.T) {

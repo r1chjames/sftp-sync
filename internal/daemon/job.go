@@ -14,6 +14,7 @@ type jobSyncer interface {
 	SyncNow()
 	Pause()
 	Resume()
+	IsPaused() bool
 }
 
 // Job represents a managed sync job.
@@ -35,6 +36,7 @@ type JobResponse struct {
 // StatusResponse mirrors syncer.SyncStatus for JSON serialisation.
 type StatusResponse struct {
 	Phase              string    `json:"phase"`
+	Paused             bool      `json:"paused"`
 	LastSync           time.Time `json:"last_sync,omitempty"`
 	LastSuccessfulSync time.Time `json:"last_successful_sync,omitempty"`
 	FilesTotal         int       `json:"files_total"`
@@ -58,6 +60,7 @@ func (j *Job) toResponse() JobResponse {
 	st := j.syncer.Status()
 	sr := StatusResponse{
 		Phase:              string(st.Phase),
+		Paused:             st.Paused,
 		LastSync:           st.LastSync,
 		LastSuccessfulSync: st.LastSuccessfulSync,
 		FilesTotal:         st.FilesTotal,

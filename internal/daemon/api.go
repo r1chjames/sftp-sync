@@ -82,6 +82,8 @@ func (d *Daemon) jobControl(w http.ResponseWriter, r *http.Request, action strin
 		return
 	}
 
+	prevPaused := job.syncer.IsPaused()
+
 	switch action {
 	case "sync":
 		job.syncer.SyncNow()
@@ -92,6 +94,23 @@ func (d *Daemon) jobControl(w http.ResponseWriter, r *http.Request, action strin
 	default:
 		http.Error(w, "unsupported action: "+action, http.StatusInternalServerError)
 		return
+	}
+
+	// A changed paused state must be durable, so a job comes back after a
+	// restart in the state the user asked for. An idempotent call changes
+	// nothing and therefore needs no write.
+	if action != "sync" && job.syncer.IsPaused() != prevPaused {
+		if err := d.saveRegistry(); err != nil {
+			// Roll the runtime state back so it cannot disagree with the
+			// registry, and report the failure instead of claiming success.
+			if prevPaused {
+				job.syncer.Pause()
+			} else {
+				job.syncer.Resume()
+			}
+			http.Error(w, fmt.Sprintf("persist %s for job %s: %v", action, id, err), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusAccepted, job.toResponse())

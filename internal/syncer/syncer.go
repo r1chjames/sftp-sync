@@ -40,6 +40,7 @@ const byteProgressInterval = 200 * time.Millisecond
 // SyncStatus is a snapshot of the syncer's current state.
 type SyncStatus struct {
 	Phase                     SyncPhase
+	Paused                    bool
 	LastSync                  time.Time
 	LastSuccessfulSync        time.Time
 	FilesTotal                int
@@ -108,6 +109,7 @@ func (s *Syncer) Pause() {
 		return
 	}
 	s.paused = true
+	s.status.Paused = true
 	s.mu.Unlock()
 
 	// Wake the loop so a job waiting out its interval becomes paused now
@@ -127,6 +129,7 @@ func (s *Syncer) Resume() {
 		return
 	}
 	s.paused = false
+	s.status.Paused = false
 	s.mu.Unlock()
 
 	s.SyncNow()
