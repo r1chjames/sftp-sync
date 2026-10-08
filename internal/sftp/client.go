@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -23,10 +24,23 @@ type RemoteFile struct {
 }
 
 // Client wraps an SFTP connection and provides high-level operations.
+//
+// It is used concurrently by the download workers, so the connection fields are
+// guarded by mu. The sftp.Client itself multiplexes concurrent requests, which is
+// what makes parallel downloads possible, but replacing or closing it is not safe
+// while another goroutine is using it: every access goes through current, and
+// closing happens only under the lock.
 type Client struct {
-	cfg   *config.Config
+	cfg *config.Config
+
+	mu    sync.Mutex
 	conn  *ssh.Client
 	sftpc *sftp.Client
+	// stale is set after a transport failure. The underlying connection cannot
+	// be closed from the worker that noticed the failure without disturbing the
+	// transfers other workers are running, so it is marked instead and replaced
+	// by the next worker that needs a connection.
+	stale bool
 }
 
 func New(cfg *config.Config) *Client {
@@ -36,7 +50,17 @@ func New(cfg *config.Config) *Client {
 // Connect establishes the SSH and SFTP connections. Safe to call if already
 // connected — it will close the existing connection first.
 func (c *Client) Connect() error {
-	c.Close()
+	// Held for the whole dial: the workers that noticed a stale connection would
+	// otherwise all attempt to replace it at once, and the last one would win
+	// while the others' new connections leaked.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.connectLocked()
+}
+
+func (c *Client) connectLocked() error {
+	c.closeLocked()
 
 	authMethods, err := c.authMethods()
 	if err != nil {
@@ -69,28 +93,82 @@ func (c *Client) Connect() error {
 
 	c.conn = conn
 	c.sftpc = sftpc
+	c.stale = false
 	return nil
 }
 
 // IsConnected returns true if the connection appears healthy.
 func (c *Client) IsConnected() bool {
-	if c.sftpc == nil {
+	client := c.current()
+	if client == nil {
 		return false
 	}
-	_, err := c.sftpc.Getwd()
+	_, err := client.Getwd()
 	return err == nil
 }
 
 // EnsureConnected reconnects only if the current connection is unhealthy.
 func (c *Client) EnsureConnected() error {
-	if c.IsConnected() {
+	c.mu.Lock()
+	stale := c.stale
+	c.mu.Unlock()
+
+	// A connection marked stale by a transport failure is replaced even if it
+	// still answers a probe: the failure was real, and the next transfer is the
+	// one that would hit it again.
+	if !stale && c.IsConnected() {
 		return nil
 	}
 	return c.Connect()
 }
 
+// MarkStale records that the current connection failed in transit and must be
+// replaced before it is used again. It does not close anything, because other
+// workers may still be mid-transfer on the same connection.
+func (c *Client) MarkStale() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stale = true
+}
+
+// current returns the SFTP client, or nil when there is none.
+func (c *Client) current() *sftp.Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sftpc
+}
+
+// ready returns a usable SFTP client, reconnecting first when the connection is
+// missing or was marked stale by a transport failure.
+//
+// It deliberately does not probe the connection: it is called once per file, and
+// an extra round trip per file to ask whether the connection is still there
+// would cost more than the retry that already handles a connection that has
+// quietly died.
+func (c *Client) ready() (*sftp.Client, error) {
+	c.mu.Lock()
+	if c.sftpc != nil && !c.stale {
+		client := c.sftpc
+		c.mu.Unlock()
+		return client, nil
+	}
+	if err := c.connectLocked(); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	client := c.sftpc
+	c.mu.Unlock()
+	return client, nil
+}
+
 // Close shuts down the SFTP and SSH connections.
 func (c *Client) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeLocked()
+}
+
+func (c *Client) closeLocked() {
 	if c.sftpc != nil {
 		c.sftpc.Close()
 		c.sftpc = nil
@@ -99,11 +177,17 @@ func (c *Client) Close() {
 		c.conn.Close()
 		c.conn = nil
 	}
+	c.stale = false
 }
 
 // Walk returns all regular files under remotePath recursively.
 func (c *Client) Walk(remotePath string) ([]RemoteFile, error) {
-	walker := c.sftpc.Walk(remotePath)
+	client, err := c.ready()
+	if err != nil {
+		return nil, err
+	}
+
+	walker := client.Walk(remotePath)
 	var files []RemoteFile
 	for walker.Step() {
 		if err := walker.Err(); err != nil {
@@ -147,7 +231,12 @@ func (c *Client) DownloadTemp(remotePath, stagingDir string) (string, error) {
 // cumulative number of bytes copied. progress may be nil. If progress returns
 // an error the transfer stops and the temp file is removed.
 func (c *Client) DownloadTempProgress(remotePath, stagingDir string, progress func(copied int64) error) (string, error) {
-	src, err := c.sftpc.Open(remotePath)
+	client, err := c.ready()
+	if err != nil {
+		return "", err
+	}
+
+	src, err := client.Open(remotePath)
 	if err != nil {
 		return "", fmt.Errorf("open remote: %w", err)
 	}

@@ -152,3 +152,43 @@ func TestCollisionPolicyDefaultAndValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestMaxAttemptsDefaultAndValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   int
+		want    int
+		wantErr bool
+	}{
+		{name: "unset defaults to three", value: 0, want: 3},
+		{name: "one is allowed", value: 1, want: 1},
+		{name: "ten is allowed", value: 10, want: 10},
+		{name: "negative is rejected", value: -1, wantErr: true},
+		{name: "above the ceiling is rejected", value: 11, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Sync.MaxAttempts = tt.value
+
+			err := cfg.validate()
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("validate() = nil, want an error for %d", tt.value)
+				}
+				if !strings.Contains(err.Error(), "sync.max_attempts") {
+					t.Fatalf("error = %v, want sync.max_attempts", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validate() error = %v", err)
+			}
+			if cfg.Sync.MaxAttempts != tt.want {
+				t.Fatalf("max attempts = %d, want %d", cfg.Sync.MaxAttempts, tt.want)
+			}
+		})
+	}
+}

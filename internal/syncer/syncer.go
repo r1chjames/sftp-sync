@@ -81,6 +81,10 @@ type Syncer struct {
 	// collapse into a single follow-up cycle.
 	syncNow chan struct{}
 
+	// jitter supplies the random half of a retry backoff. It is a field so tests
+	// can make backoff deterministic.
+	jitter func() float64
+
 	// syncFn runs one cycle. It is a field so tests can drive the loop without
 	// an SFTP server; production code always uses (*Syncer).sync.
 	syncFn func(context.Context) error
@@ -91,6 +95,7 @@ func New(cfg *config.Config) *Syncer {
 		cfg:     cfg,
 		client:  sftpclient.New(cfg),
 		status:  SyncStatus{Phase: PhaseIdle},
+		jitter:  defaultJitter,
 		done:    make(chan struct{}),
 		syncNow: make(chan struct{}, 1),
 		pauseCh: make(chan struct{}, 1),
@@ -280,6 +285,14 @@ func (p *fileProgress) update(copied int64) error {
 // file's outcome so a failure subtracts exactly what the file contributed.
 func (p *fileProgress) flush() {
 	p.emit()
+}
+
+// reset forgets what this attempt reported, so a retry starts a fresh file
+// transfer rather than continuing the byte count of the attempt that failed.
+func (p *fileProgress) reset() {
+	p.copied = 0
+	p.reported = 0
+	p.lastEmit = time.Time{}
 }
 
 func (p *fileProgress) emit() {
@@ -484,9 +497,12 @@ func (s *Syncer) sync(ctx context.Context) error {
 		}
 		log.Printf("downloading %d new/changed file(s) (of %d eligible, %d bytes)", len(toDownload), eligible, batchBytes)
 		s.beginDownload(len(toDownload), batchBytes)
-		if err := s.downloadAll(ctx, toDownload); err != nil {
+		result, err := s.downloadAll(ctx, toDownload)
+		if err != nil {
 			return err
 		}
+		log.Printf("batch finished: %d synced, %d skipped, %d failed of %d",
+			result.Completed, result.Skipped, result.Failed, result.Attempted)
 	} else {
 		log.Printf("up to date — %d eligible remote file(s)", eligible)
 	}
@@ -522,15 +538,8 @@ func (s *Syncer) selectForDownload(remoteFiles []sftpclient.RemoteFile) (int, []
 	return eligible, toDownload
 }
 
-func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile) error {
-	type result struct {
-		file      sftpclient.RemoteFile
-		localPath string
-		skipped   bool
-		err       error
-	}
-
-	results := make(chan result, len(files))
+func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile) (batchResult, error) {
+	results := make(chan downloadOutcome, len(files))
 	sem := make(chan struct{}, s.cfg.Sync.Workers)
 	var wg sync.WaitGroup
 
@@ -561,7 +570,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 					s.cfg.Sync.CollisionPolicy, f.Path, s.localPath(f.Path))
 				if skipped || err != nil {
 					s.recordSkipOrFailure(f.Path, err)
-					results <- result{file: f, skipped: skipped, err: err}
+					results <- downloadOutcome{file: f, skipped: skipped, err: err}
 					return
 				}
 				_ = destination // re-resolved below, which is idempotent
@@ -574,15 +583,15 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 				record:   func(delta, copied, total int64) { s.recordBytes(f.Path, delta, copied, total) },
 			}
 
-			// Stage the download to a temp file so we can inspect it.
-			tmpPath, err := s.client.DownloadTempProgress(f.Path, s.cfg.LocalPath, fp.update)
-
-			// Flush bytes withheld by throttling before recording any outcome,
-			// so a failure subtracts exactly what this file contributed.
-			fp.flush()
+			// Stage the download to a temp file so we can inspect it. Transient
+			// failures are retried with backoff; each attempt restarts the file
+			// from the beginning, so a partial attempt is not progress.
+			tmpPath, err := s.downloadWithRetries(ctx, f.Path, fp, func() (string, error) {
+				return s.client.DownloadTempProgress(f.Path, s.cfg.LocalPath, fp.update)
+			})
 			if err != nil {
 				s.recordFileResult(f.Path, err, fp.copied)
-				results <- result{file: f, err: err}
+				results <- downloadOutcome{file: f, err: err}
 				return
 			}
 
@@ -600,7 +609,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			if skipped || err != nil {
 				os.Remove(tmpPath)
 				s.recordSkipOrFailure(f.Path, err)
-				results <- result{file: f, skipped: skipped, err: err}
+				results <- downloadOutcome{file: f, skipped: skipped, err: err}
 				return
 			}
 
@@ -609,7 +618,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 				os.Remove(tmpPath)
 				err = fmt.Errorf("mkdir: %w", err)
 				s.recordFileResult(f.Path, err, fp.copied)
-				results <- result{file: f, err: err}
+				results <- downloadOutcome{file: f, err: err}
 				return
 			}
 
@@ -617,7 +626,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 				os.Remove(tmpPath)
 				err = fmt.Errorf("rename: %w", err)
 				s.recordFileResult(f.Path, err, fp.copied)
-				results <- result{file: f, err: err}
+				results <- downloadOutcome{file: f, err: err}
 				return
 			}
 
@@ -631,31 +640,50 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			}
 
 			s.recordFileResult(f.Path, nil, fp.copied)
-			results <- result{file: f, localPath: finalPath}
+			results <- downloadOutcome{file: f, localPath: finalPath}
 		}(f)
 	}
 
 	wg.Wait()
 	close(results)
 
-	failed := 0
-	var firstFailure result
-
-	// Update manifest serially after all downloads complete.
+	collected := make([]downloadOutcome, 0, len(files))
 	for r := range results {
+		collected = append(collected, r)
+	}
+
+	result := s.applyDownloadOutcomes(collected, attempted, len(files))
+
+	if err := s.manifest.Save(); err != nil {
+		log.Printf("warning: could not save manifest: %v", err)
+	}
+
+	if err := result.failureError(); err != nil {
+		return result, err
+	}
+	return result, incompleteBatchError(attempted, len(files), ctx.Err())
+}
+
+// applyDownloadOutcomes records each worker's outcome and updates the manifest.
+// It runs after the workers finish, so the manifest has a single writer, and it
+// is separate from downloadAll so the manifest and batch bookkeeping can be
+// tested without a live SFTP server.
+func (s *Syncer) applyDownloadOutcomes(outcomes []downloadOutcome, attempted, total int) batchResult {
+	result := batchResult{Attempted: attempted, Total: total}
+
+	for _, r := range outcomes {
 		if r.err != nil {
-			failed++
-			if failed == 1 {
-				firstFailure = r
-			}
+			result.Failed++
+			result.Failures = append(result.Failures, fileFailure{Path: r.file.Path, Err: r.err})
 			log.Printf("download failed %s: %v", r.file.Path, r.err)
 			continue
 		}
 		if r.skipped {
-			// A skipped file is deliberately absent from the manifest: it was
-			// not synced, and recording it would claim otherwise.
+			result.Skipped++
 			continue
 		}
+
+		result.Completed++
 		log.Printf("synced: %s", r.file.Path)
 		s.manifest.Set(r.file.Path, state.Entry{
 			MTime: r.file.MTime,
@@ -666,14 +694,63 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 		})
 	}
 
-	if err := s.manifest.Save(); err != nil {
-		log.Printf("warning: could not save manifest: %v", err)
+	return result
+}
+
+// batchResult is what one download batch produced.
+//
+// It exists so a partially failed batch can be reported with a bounded summary:
+// one huge batch of failures must not turn into an unbounded status or API
+// response, and the detail belongs in the log.
+type batchResult struct {
+	Attempted int
+	Total     int
+	Completed int
+	Skipped   int
+	Failed    int
+	// Failures holds one entry per failed file, in worker-completion order.
+	Failures []fileFailure
+}
+
+// fileFailure is one file's failure, kept for the aggregate summary.
+type fileFailure struct {
+	Path string
+	Err  error
+}
+
+// downloadOutcome is what one worker produced for one file.
+type downloadOutcome struct {
+	file      sftpclient.RemoteFile
+	localPath string
+	skipped   bool
+	err       error
+}
+
+// failureError summarises a failed batch for the job status.
+//
+// The summary names the first failure and counts the rest, and each error is
+// bounded, so the string cannot grow with the size of the batch.
+func (r batchResult) failureError() error {
+	if r.Failed == 0 {
+		return nil
 	}
 
-	if err := downloadBatchError(failed, len(files), firstFailure.file.Path, firstFailure.err); err != nil {
-		return err
+	first := r.Failures[0]
+	head := fmt.Sprintf("%d of %d file(s) failed", r.Failed, r.Attempted)
+	if r.Failed > 1 {
+		head += fmt.Sprintf(" (%d more in the daemon log)", r.Failed-1)
 	}
-	return incompleteBatchError(attempted, len(files), ctx.Err())
+	head += fmt.Sprintf("; first %s", first.Path)
+
+	// A normal error is wrapped, so a caller can still inspect the cause. An
+	// error long enough to matter is truncated instead, which necessarily drops
+	// the chain: the text that would have to be preserved is what is being
+	// bounded. Either way the returned string is bounded by the header plus
+	// maxFailureDetail, whatever the batch size was.
+	if len(first.Err.Error()) <= maxFailureDetail {
+		return fmt.Errorf("%s: %w", head, first.Err)
+	}
+	return fmt.Errorf("%s: %s", head, truncateText(first.Err.Error(), maxFailureDetail))
 }
 
 // incompleteBatchError describes a batch that stopped before every file was
@@ -688,13 +765,6 @@ func incompleteBatchError(attempted, total int, ctxErr error) error {
 		return fmt.Errorf("batch interrupted: %d of %d file(s) not attempted: %w", total-attempted, total, ctxErr)
 	}
 	return errBatchPaused
-}
-
-func downloadBatchError(failed, total int, firstPath string, firstErr error) error {
-	if failed == 0 {
-		return nil
-	}
-	return fmt.Errorf("%d of %d file(s) failed; first failure %s: %w", failed, total, firstPath, firstErr)
 }
 
 func (s *Syncer) localPath(remotePath string) string {

@@ -148,9 +148,36 @@ sync:
 
   # What to do when a destination is already taken.
   collision_policy: rename       # rename | skip | error
+
+  # Attempts per file before it is reported as failed.
+  max_attempts: 3
 ```
 
 You can have as many config files as you like — one per SFTP source — and submit them all to the same running daemon.
+
+### Failures and retries
+
+A file transfer that fails on a dropped connection, a timeout, or a truncated
+transfer is retried up to `max_attempts` times, waiting with exponential backoff
+(0.5s, 1s, 2s, … capped at 8s) plus jitter so several workers do not all come
+back at once. Shutdown and `sftpsync pause` interrupt a retry wait immediately.
+
+A failure that is not transient — permission denied, a path that does not exist,
+an invalid destination — is reported straight away, because another attempt
+cannot fix it. The connection is replaced after a transport failure, so a retry
+gets a fresh one.
+
+Files that succeed are recorded in the manifest and are not downloaded again.
+Files that fail are left out, so the next poll picks them up automatically. A
+batch that has failures reports them in `sftpsync status`:
+
+```
+error: 3 of 120 file(s) failed (2 more in the daemon log); first /photos/IMG_0042.JPG: open remote: connection lost
+```
+
+The summary names the first failure and counts the rest; the full error for every
+file is in the daemon log. Each error in the summary is truncated to 200 bytes, so
+a large failed batch cannot produce an unbounded status response.
 
 ### Filename collisions
 

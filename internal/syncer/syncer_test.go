@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -342,22 +343,37 @@ func TestIncompleteBatchError(t *testing.T) {
 	}
 }
 
-func TestDownloadBatchError(t *testing.T) {
-	if err := downloadBatchError(0, 3, "", nil); err != nil {
+func TestBatchResultFailureError(t *testing.T) {
+	if err := (batchResult{Attempted: 3, Completed: 3}).failureError(); err != nil {
 		t.Fatalf("successful batch error = %v, want nil", err)
 	}
 
 	firstErr := errors.New("copy failed")
-	err := downloadBatchError(2, 3, "/photos/a.jpg", firstErr)
+	one := batchResult{Attempted: 3, Failed: 1, Failures: []fileFailure{{Path: "/photos/a.jpg", Err: firstErr}}}
+	err := one.failureError()
 	if err == nil {
 		t.Fatal("failed batch returned nil")
 	}
 	if !errors.Is(err, firstErr) {
-		t.Fatalf("batch error %v does not wrap first failure", err)
+		t.Fatalf("batch error %v does not wrap a short first failure", err)
 	}
-	want := "2 of 3 file(s) failed; first failure /photos/a.jpg: copy failed"
-	if err.Error() != want {
+	if want := "1 of 3 file(s) failed; first /photos/a.jpg: copy failed"; err.Error() != want {
 		t.Fatalf("batch error = %q, want %q", err, want)
+	}
+
+	many := batchResult{Attempted: 500, Failed: 120, Failures: []fileFailure{{Path: "/photos/a.jpg", Err: firstErr}}}
+	if want := "120 of 500 file(s) failed (119 more in the daemon log); first /photos/a.jpg: copy failed"; many.failureError().Error() != want {
+		t.Fatalf("batch error = %q, want %q", many.failureError(), want)
+	}
+
+	// A pathological error must not be able to grow the status string.
+	huge := batchResult{Attempted: 1, Failed: 1, Failures: []fileFailure{{Path: "/photos/a.jpg", Err: errors.New(strings.Repeat("x", 50_000))}}}
+	got := huge.failureError().Error()
+	if len(got) > 400 {
+		t.Fatalf("error is %d bytes, want it bounded", len(got))
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("error = %q, want it to mark the truncation", got)
 	}
 }
 
