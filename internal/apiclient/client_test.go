@@ -1,6 +1,7 @@
 package apiclient
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -249,7 +250,33 @@ func TestJobControlRejectsUnexpectedSuccessCode(t *testing.T) {
 func TestTransportErrorIsReturned(t *testing.T) {
 	c := &Client{http: &http.Client{}, baseURL: "http://127.0.0.1:1"}
 
-	if _, err := c.ListJobs(); err == nil {
+	_, err := c.ListJobs()
+	if err == nil {
 		t.Fatal("ListJobs returned nil error for an unreachable daemon")
+	}
+	var unreachable *UnreachableError
+	if !errors.As(err, &unreachable) {
+		t.Fatalf("error = %v, want an UnreachableError so callers can tell it from a daemon error", err)
+	}
+}
+
+func TestTransportErrorFromControlMethods(t *testing.T) {
+	c := &Client{http: &http.Client{}, baseURL: "http://127.0.0.1:1"}
+
+	for _, call := range []func() error{
+		func() error { _, err := c.SyncJob("abc12345"); return err },
+		func() error { _, err := c.PauseJob("abc12345"); return err },
+		func() error { _, err := c.ResumeJob("abc12345"); return err },
+		func() error { return c.Shutdown() },
+		func() error { return c.Ping() },
+	} {
+		err := call()
+		if err == nil {
+			t.Fatal("call returned nil error for an unreachable daemon")
+		}
+		var unreachable *UnreachableError
+		if !errors.As(err, &unreachable) {
+			t.Fatalf("error = %v, want an UnreachableError", err)
+		}
 	}
 }

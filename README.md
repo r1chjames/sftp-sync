@@ -59,9 +59,34 @@ List and manage jobs:
 sftpsync list
 sftpsync status
 sftpsync status <id>
+sftpsync sync <id>      # scan and download now
+sftpsync pause <id>     # stop starting new work
+sftpsync resume <id>    # clear the paused state and scan now
 sftpsync remove <id>
-sftpsync stop       # shut down the daemon
+sftpsync stop           # shut down the daemon
 ```
+
+`sftpsync status <id>` reports the phase, whether the job is paused, file and
+batch progress, byte progress with a percentage, the file being downloaded, the
+last successful sync, and the latest error, for example:
+
+```text
+id:            abc12345
+config:        /home/me/photos.yaml
+phase:         downloading
+paused:        no
+last sync:     2024-06-15 12:00:05
+last success:  2024-06-15 11:00:05
+files:         64
+eligible:      64
+batch:         18/64 complete, 0 failed, 46 remaining
+bytes:         1.4 MB of 5.0 MB (28%)
+current file:  IMG_0042.CR3
+current bytes: 900.0 KB of 3.1 MB (28%)
+```
+
+Commands exit `0` on success, `1` when the request fails, and `2` on an invalid
+command line (for example a missing job ID).
 
 ### Job controls
 
