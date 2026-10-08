@@ -81,7 +81,7 @@ func TestActiveRefreshIntervalMeetsStalenessBound(t *testing.T) {
 }
 
 func TestJobSlotViewWithoutABatchYet(t *testing.T) {
-	view := JobSlotView(job("photos", daemon.StatusResponse{Phase: "idle", FilesTotal: 3}))
+	view := JobSlotView(job("photos", daemon.StatusResponse{Phase: "idle", FilesTotal: 3}), "")
 
 	if view.Header != "● photos" {
 		t.Fatalf("header = %q", view.Header)
@@ -113,7 +113,7 @@ func TestJobSlotViewWhileDownloading(t *testing.T) {
 		CurrentFileBytesTotal:     3276800,
 		CurrentFileBytesCompleted: 921600,
 		LastSuccessfulSync:        time.Date(2024, 6, 15, 11, 0, 0, 0, time.UTC),
-	}))
+	}), "")
 
 	if view.Header != "⟳ photos" {
 		t.Fatalf("header = %q", view.Header)
@@ -139,7 +139,7 @@ func TestJobSlotViewIncludesFailuresInProgress(t *testing.T) {
 		Completed:  7,
 		Failed:     2,
 		Remaining:  1,
-	}))
+	}), "")
 
 	if !strings.Contains(view.State, "9 of 10 files") {
 		t.Fatalf("state = %q, want failed files counted as attempted", view.State)
@@ -155,7 +155,7 @@ func TestJobSlotViewOnCompletion(t *testing.T) {
 		BytesTotal:         1024,
 		BytesCompleted:     1024,
 		LastSuccessfulSync: time.Date(2024, 6, 15, 11, 0, 0, 0, time.UTC),
-	}))
+	}), "")
 
 	if view.Header != "● photos" {
 		t.Fatalf("header = %q", view.Header)
@@ -170,7 +170,7 @@ func TestJobSlotViewOnCompletion(t *testing.T) {
 
 func TestJobSlotViewWhilePaused(t *testing.T) {
 	// Settled: the phase is paused and nothing is moving.
-	settled := JobSlotView(job("photos", daemon.StatusResponse{Phase: "paused", Paused: true, FilesTotal: 64}))
+	settled := JobSlotView(job("photos", daemon.StatusResponse{Phase: "paused", Paused: true, FilesTotal: 64}), "")
 	if settled.Header != "⏸ photos" {
 		t.Fatalf("header = %q", settled.Header)
 	}
@@ -181,7 +181,7 @@ func TestJobSlotViewWhilePaused(t *testing.T) {
 	// Draining: a pause was requested while a batch is still finishing.
 	draining := JobSlotView(job("photos", daemon.StatusResponse{
 		Phase: "downloading", Paused: true, BatchTotal: 4, Completed: 1, BytesTotal: 100, BytesCompleted: 25,
-	}))
+	}), "")
 	if draining.Header != "⏸ photos" {
 		t.Fatalf("header = %q", draining.Header)
 	}
@@ -192,7 +192,7 @@ func TestJobSlotViewWhilePaused(t *testing.T) {
 
 func TestJobSlotViewWithNoTotals(t *testing.T) {
 	// A job that has never completed a batch must not render "0 of 0" or 0%.
-	view := JobSlotView(job("photos", daemon.StatusResponse{Phase: "scanning"}))
+	view := JobSlotView(job("photos", daemon.StatusResponse{Phase: "scanning"}), "")
 
 	if view.State != "  scanning" {
 		t.Fatalf("state = %q", view.State)
@@ -209,7 +209,7 @@ func TestJobSlotViewWithError(t *testing.T) {
 		FilesTotal:         64,
 		LastError:          full,
 		LastSuccessfulSync: time.Date(2024, 6, 15, 11, 0, 0, 0, time.UTC),
-	}))
+	}), "")
 
 	if view.Header != "⚠ photos" {
 		t.Fatalf("header = %q", view.Header)
@@ -332,6 +332,72 @@ func TestStatusPrefix(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := StatusPrefix(tt.status); got != tt.want {
 				t.Fatalf("StatusPrefix() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSlotControlsFor(t *testing.T) {
+	active := SlotControlsFor(false)
+	if !active.ShowPause || active.ShowResume {
+		t.Fatalf("active controls = %+v, want Pause only", active)
+	}
+
+	paused := SlotControlsFor(true)
+	if paused.ShowPause || !paused.ShowResume {
+		t.Fatalf("paused controls = %+v, want Resume only", paused)
+	}
+}
+
+func TestJobSlotViewShowsActionFailureBesideTheSyncError(t *testing.T) {
+	view := JobSlotView(job("photos", daemon.StatusResponse{
+		Phase:     "error",
+		LastError: "connect: auth: permission denied",
+	}), "pause failed: persist pause for job abc12345: permission denied")
+
+	if view.Error != "  ⚠ connect: auth: permission denied" {
+		t.Fatalf("error = %q, want the daemon's own error kept", view.Error)
+	}
+	if view.ActionError != "  ⚠ pause failed: persist pause for job abc12345: permission denied" {
+		t.Fatalf("action error = %q", view.ActionError)
+	}
+}
+
+func TestJobSlotViewWithoutActionFailure(t *testing.T) {
+	view := JobSlotView(job("photos", daemon.StatusResponse{Phase: "idle"}), "")
+
+	if view.ActionError != "" {
+		t.Fatalf("action error = %q, want no row", view.ActionError)
+	}
+}
+
+func TestActionFailure(t *testing.T) {
+	if got := ActionFailure("pause", errors.New("daemon unreachable")); got != "pause failed: daemon unreachable" {
+		t.Fatalf("ActionFailure() = %q", got)
+	}
+	if got := ActionFailure("resume", nil); got != "" {
+		t.Fatalf("ActionFailure() with no error = %q, want empty", got)
+	}
+}
+
+func TestAdditionalJobsNotice(t *testing.T) {
+	tests := []struct {
+		name  string
+		total int
+		shown int
+		want  string
+	}{
+		{name: "nothing to report", total: 3, shown: 10, want: ""},
+		{name: "exactly full", total: 10, shown: 10, want: ""},
+		{name: "none at all", total: 0, shown: 10, want: ""},
+		{name: "one hidden", total: 11, shown: 10, want: "1 additional job not shown"},
+		{name: "several hidden", total: 14, shown: 10, want: "4 additional jobs not shown"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := AdditionalJobsNotice(tt.total, tt.shown); got != tt.want {
+				t.Fatalf("AdditionalJobsNotice(%d, %d) = %q, want %q", tt.total, tt.shown, got, tt.want)
 			}
 		})
 	}
