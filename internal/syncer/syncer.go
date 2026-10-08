@@ -16,12 +16,32 @@ import (
 	"github.com/r1chjames/sftp-sync/internal/state"
 )
 
+// SyncPhase describes the current stage of a sync cycle.
+type SyncPhase string
+
+const (
+	PhaseIdle        SyncPhase = "idle"
+	PhaseScanning    SyncPhase = "scanning"
+	PhaseDownloading SyncPhase = "downloading"
+	PhasePaused      SyncPhase = "paused"
+	PhaseError       SyncPhase = "error"
+)
+
 // SyncStatus is a snapshot of the syncer's current state.
 type SyncStatus struct {
-	LastSync   time.Time
-	FilesTotal int
-	Pending    int
-	LastError  error
+	Phase              SyncPhase
+	LastSync           time.Time
+	LastSuccessfulSync time.Time
+	FilesTotal         int
+	Pending            int
+	EligibleFiles      int
+	BatchTotal         int
+	Completed          int
+	Failed             int
+	Remaining          int
+	CurrentFile        string
+	StartedAt          time.Time
+	LastError          error
 }
 
 // Syncer polls an SFTP server and downloads new or changed files.
@@ -40,6 +60,7 @@ func New(cfg *config.Config) *Syncer {
 	return &Syncer{
 		cfg:    cfg,
 		client: sftpclient.New(cfg),
+		status: SyncStatus{Phase: PhaseIdle},
 		done:   make(chan struct{}),
 	}
 }
@@ -73,6 +94,77 @@ func (s *Syncer) Status() SyncStatus {
 	return s.status
 }
 
+func (s *Syncer) beginScan() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Phase = PhaseScanning
+	s.status.BatchTotal = 0
+	s.status.Completed = 0
+	s.status.Failed = 0
+	s.status.Remaining = 0
+	s.status.Pending = 0
+	s.status.CurrentFile = ""
+	s.status.StartedAt = time.Now()
+}
+
+func (s *Syncer) setEligibleFiles(total int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.EligibleFiles = total
+	s.status.FilesTotal = total
+}
+
+func (s *Syncer) beginDownload(total int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Phase = PhaseDownloading
+	s.status.BatchTotal = total
+	s.status.Remaining = total
+	s.status.Pending = total
+}
+
+func (s *Syncer) setCurrentFile(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.CurrentFile = path
+}
+
+func (s *Syncer) recordFileResult(path string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		s.status.Failed++
+	} else {
+		s.status.Completed++
+	}
+	if s.status.Remaining > 0 {
+		s.status.Remaining--
+	}
+	s.status.Pending = s.status.Remaining
+	if s.status.CurrentFile == path {
+		s.status.CurrentFile = ""
+	}
+}
+
+func (s *Syncer) markSuccess() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.status.Phase = PhaseIdle
+	s.status.LastSync = now
+	s.status.LastSuccessfulSync = now
+	s.status.LastError = nil
+	s.status.CurrentFile = ""
+}
+
+func (s *Syncer) markFailure(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Phase = PhaseError
+	s.status.LastSync = time.Now()
+	s.status.LastError = err
+}
+
 func (s *Syncer) run(ctx context.Context) {
 	defer close(s.done)
 
@@ -80,9 +172,9 @@ func (s *Syncer) run(ctx context.Context) {
 	for {
 		if err := s.sync(ctx); err != nil {
 			log.Printf("sync error: %v", err)
-			s.mu.Lock()
-			s.status.LastError = err
-			s.mu.Unlock()
+			s.markFailure(err)
+		} else {
+			s.markSuccess()
 		}
 
 		select {
@@ -95,6 +187,8 @@ func (s *Syncer) run(ctx context.Context) {
 }
 
 func (s *Syncer) sync(ctx context.Context) error {
+	s.beginScan()
+
 	if err := s.client.EnsureConnected(); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -105,11 +199,34 @@ func (s *Syncer) sync(ctx context.Context) error {
 		return fmt.Errorf("walk %s: %w", s.cfg.SFTP.RemotePath, err)
 	}
 
+	eligible, toDownload := s.selectForDownload(remoteFiles)
+	s.setEligibleFiles(eligible)
+
+	if err := s.manifest.Save(); err != nil {
+		log.Printf("warning: could not save manifest after adoption: %v", err)
+	}
+
+	if len(toDownload) > 0 {
+		log.Printf("downloading %d new/changed file(s) (of %d eligible)", len(toDownload), eligible)
+		s.beginDownload(len(toDownload))
+		if err := s.downloadAll(ctx, toDownload); err != nil {
+			return err
+		}
+	} else {
+		log.Printf("up to date — %d eligible remote file(s)", eligible)
+	}
+
+	return nil
+}
+
+func (s *Syncer) selectForDownload(remoteFiles []sftpclient.RemoteFile) (int, []sftpclient.RemoteFile) {
 	var toDownload []sftpclient.RemoteFile
+	eligible := 0
 	for _, f := range remoteFiles {
 		if !s.matchesFilter(f.Path) {
 			continue
 		}
+		eligible++
 		entry, ok := s.manifest.Get(f.Path)
 		if !ok || !entry.MTime.Equal(f.MTime) || entry.Size != f.Size {
 			// For files not yet in the manifest, adopt them if they already
@@ -124,29 +241,10 @@ func (s *Syncer) sync(ctx context.Context) error {
 			toDownload = append(toDownload, f)
 		}
 	}
-
-	if err := s.manifest.Save(); err != nil {
-		log.Printf("warning: could not save manifest after adoption: %v", err)
-	}
-
-	if len(toDownload) > 0 {
-		log.Printf("downloading %d new/changed file(s) (of %d total)", len(toDownload), len(remoteFiles))
-		s.downloadAll(ctx, toDownload)
-	} else {
-		log.Printf("up to date — %d remote file(s)", len(remoteFiles))
-	}
-
-	s.mu.Lock()
-	s.status.LastSync = time.Now()
-	s.status.FilesTotal = len(remoteFiles)
-	s.status.Pending = 0
-	s.status.LastError = nil
-	s.mu.Unlock()
-
-	return nil
+	return eligible, toDownload
 }
 
-func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile) {
+func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile) error {
 	type result struct {
 		file sftpclient.RemoteFile
 		err  error
@@ -167,9 +265,12 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			s.setCurrentFile(f.Path)
+
 			// Stage the download to a temp file so we can inspect it.
 			tmpPath, err := s.client.DownloadTemp(f.Path, s.cfg.LocalPath)
 			if err != nil {
+				s.recordFileResult(f.Path, err)
 				results <- result{file: f, err: err}
 				return
 			}
@@ -186,13 +287,17 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			// Ensure destination directory exists, then place the file.
 			if err := os.MkdirAll(filepath.Dir(finalPath), 0755); err != nil {
 				os.Remove(tmpPath)
-				results <- result{file: f, err: fmt.Errorf("mkdir: %w", err)}
+				err = fmt.Errorf("mkdir: %w", err)
+				s.recordFileResult(f.Path, err)
+				results <- result{file: f, err: err}
 				return
 			}
 
 			if err := os.Rename(tmpPath, finalPath); err != nil {
 				os.Remove(tmpPath)
-				results <- result{file: f, err: fmt.Errorf("rename: %w", err)}
+				err = fmt.Errorf("rename: %w", err)
+				s.recordFileResult(f.Path, err)
+				results <- result{file: f, err: err}
 				return
 			}
 
@@ -205,6 +310,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 				log.Printf("warning: could not set file times for %s: %v", finalPath, err)
 			}
 
+			s.recordFileResult(f.Path, nil)
 			results <- result{file: f, err: nil}
 		}(f)
 	}
@@ -212,9 +318,16 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 	wg.Wait()
 	close(results)
 
+	failed := 0
+	var firstFailure result
+
 	// Update manifest serially after all downloads complete.
 	for r := range results {
 		if r.err != nil {
+			failed++
+			if failed == 1 {
+				firstFailure = r
+			}
 			log.Printf("download failed %s: %v", r.file.Path, r.err)
 			continue
 		}
@@ -228,6 +341,21 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 	if err := s.manifest.Save(); err != nil {
 		log.Printf("warning: could not save manifest: %v", err)
 	}
+
+	if err := downloadBatchError(failed, len(files), firstFailure.file.Path, firstFailure.err); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func downloadBatchError(failed, total int, firstPath string, firstErr error) error {
+	if failed == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d of %d file(s) failed; first failure %s: %w", failed, total, firstPath, firstErr)
 }
 
 func (s *Syncer) localPath(remotePath string) string {

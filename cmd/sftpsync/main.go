@@ -81,7 +81,7 @@ func cmdList(c *apiclient.Client) {
 		return
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tCONFIG\tLAST SYNC\tFILES\tERROR")
+	fmt.Fprintln(tw, "ID\tPHASE\tCONFIG\tLAST SYNC\tFILES\tBATCH\tERROR")
 	for _, j := range jobs {
 		lastSync := "never"
 		if !j.Status.LastSync.IsZero() {
@@ -91,8 +91,9 @@ func cmdList(c *apiclient.Client) {
 		if errStr == "" {
 			errStr = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
-			j.ID, j.ConfigPath, lastSync, j.Status.FilesTotal, errStr)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+			j.ID, j.Status.Phase, j.ConfigPath, lastSync, j.Status.FilesTotal,
+			formatBatch(j.Status), errStr)
 	}
 	tw.Flush()
 }
@@ -143,14 +144,35 @@ func printJobDetail(j daemon.JobResponse) {
 	if !j.Status.LastSync.IsZero() {
 		lastSync = j.Status.LastSync.Format("2006-01-02 15:04:05")
 	}
-	fmt.Printf("id:        %s\n", j.ID)
-	fmt.Printf("config:    %s\n", j.ConfigPath)
-	fmt.Printf("added:     %s\n", j.AddedAt.Format("2006-01-02 15:04:05"))
-	fmt.Printf("last sync: %s\n", lastSync)
-	fmt.Printf("files:     %d\n", j.Status.FilesTotal)
-	if j.Status.LastError != "" {
-		fmt.Printf("error:     %s\n", j.Status.LastError)
+	lastSuccessfulSync := "never"
+	if !j.Status.LastSuccessfulSync.IsZero() {
+		lastSuccessfulSync = j.Status.LastSuccessfulSync.Format("2006-01-02 15:04:05")
 	}
+	fmt.Printf("id:           %s\n", j.ID)
+	fmt.Printf("config:       %s\n", j.ConfigPath)
+	fmt.Printf("added:        %s\n", j.AddedAt.Format("2006-01-02 15:04:05"))
+	fmt.Printf("phase:        %s\n", j.Status.Phase)
+	fmt.Printf("last sync:    %s\n", lastSync)
+	fmt.Printf("last success: %s\n", lastSuccessfulSync)
+	fmt.Printf("files:        %d\n", j.Status.FilesTotal)
+	fmt.Printf("batch:        %s\n", formatBatch(j.Status))
+	if !j.Status.StartedAt.IsZero() {
+		fmt.Printf("started:      %s\n", j.Status.StartedAt.Format("2006-01-02 15:04:05"))
+	}
+	if j.Status.CurrentFile != "" {
+		fmt.Printf("current:      %s\n", j.Status.CurrentFile)
+	}
+	if j.Status.LastError != "" {
+		fmt.Printf("error:        %s\n", j.Status.LastError)
+	}
+}
+
+func formatBatch(status daemon.StatusResponse) string {
+	if status.BatchTotal == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d/%d complete, %d failed, %d remaining",
+		status.Completed, status.BatchTotal, status.Failed, status.Remaining)
 }
 
 func fatalf(format string, args ...any) {
