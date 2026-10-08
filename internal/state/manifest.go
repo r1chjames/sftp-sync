@@ -12,6 +12,13 @@ import (
 type Entry struct {
 	MTime time.Time `json:"mtime"`
 	Size  int64     `json:"size"`
+	// LocalPath is the destination this remote path was written to.
+	//
+	// It is recorded because a collision may have been resolved by renaming, and
+	// the next sync must update that same file rather than choose another name.
+	// It is absent in manifests written before collision handling existed, and
+	// for files adopted from disk under their original name.
+	LocalPath string `json:"local_path,omitempty"`
 }
 
 // Manifest persists the set of remote files that have been synced locally.

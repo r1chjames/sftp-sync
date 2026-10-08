@@ -114,3 +114,41 @@ func TestValidate_FolderStructure(t *testing.T) {
 		})
 	}
 }
+
+func TestCollisionPolicyDefaultAndValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		policy  string
+		want    string
+		wantErr bool
+	}{
+		{name: "unspecified defaults to rename", policy: "", want: CollisionRename},
+		{name: "error", policy: "error", want: CollisionError},
+		{name: "skip", policy: "skip", want: CollisionSkip},
+		{name: "rename", policy: "rename", want: CollisionRename},
+		{name: "unknown is rejected", policy: "overwrite", wantErr: true},
+		{name: "case matters", policy: "Rename", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Sync.CollisionPolicy = tt.policy
+
+			err := cfg.validate()
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("validate() = nil, want an error for %q", tt.policy)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validate() error = %v", err)
+			}
+			if cfg.Sync.CollisionPolicy != tt.want {
+				t.Fatalf("policy = %q, want %q", cfg.Sync.CollisionPolicy, tt.want)
+			}
+		})
+	}
+}

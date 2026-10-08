@@ -153,9 +153,10 @@ func StateText(st daemon.StatusResponse) string {
 }
 
 // attemptedFiles counts files a batch has finished with, successfully or not,
-// and never exceeds the batch size.
+// and never exceeds the batch size. Skipped files count as finished: the
+// collision policy decided their outcome, so they are not still in flight.
 func attemptedFiles(st daemon.StatusResponse) int {
-	attempted := st.Completed + st.Failed
+	attempted := st.Completed + st.Failed + st.Skipped
 	if attempted < 0 {
 		return 0
 	}

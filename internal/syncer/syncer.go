@@ -49,6 +49,7 @@ type SyncStatus struct {
 	BatchTotal                int
 	Completed                 int
 	Failed                    int
+	Skipped                   int
 	Remaining                 int
 	BytesTotal                int64
 	BytesCompleted            int64
@@ -241,6 +242,9 @@ func (s *Syncer) beginDownload(total int, totalBytes int64) {
 	s.status.Pending = total
 	s.status.BytesTotal = totalBytes
 	s.status.BytesCompleted = 0
+	s.status.Completed = 0
+	s.status.Failed = 0
+	s.status.Skipped = 0
 }
 
 // fileProgress tracks the bytes copied for one file and forwards deltas to the
@@ -324,6 +328,31 @@ func (s *Syncer) recordFileResult(path string, err error, fileBytes int64) {
 	} else {
 		s.status.Completed++
 	}
+	s.finishFileLocked(path)
+}
+
+// recordSkipOrFailure records the outcome of a file that was settled before it
+// could be written: a skip for the collision policy, or a failure.
+func (s *Syncer) recordSkipOrFailure(path string, err error) {
+	if err != nil {
+		s.recordFileResult(path, err, 0)
+		return
+	}
+	s.recordSkipped(path)
+}
+
+// recordSkipped records a file the collision policy left alone. A skipped file
+// counts as handled so it does not leave the batch looking unfinished, but it is
+// not a success and never enters the manifest.
+func (s *Syncer) recordSkipped(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Skipped++
+	s.finishFileLocked(path)
+}
+
+// finishFileLocked retires one file from the batch counters.
+func (s *Syncer) finishFileLocked(path string) {
 	if s.status.Remaining > 0 {
 		s.status.Remaining--
 	}
@@ -478,9 +507,12 @@ func (s *Syncer) selectForDownload(remoteFiles []sftpclient.RemoteFile) (int, []
 			// For files not yet in the manifest, adopt them if they already
 			// exist locally rather than re-downloading.
 			if !ok {
-				if _, err := os.Stat(s.localPath(f.Path)); err == nil {
+				// The destination without EXIF organisation is knowable here, so
+				// adopt rather than re-downloading a file that is already local.
+				adopted := s.localPath(f.Path)
+				if _, err := os.Stat(adopted); err == nil {
 					log.Printf("adopting existing local file: %s", f.Path)
-					s.manifest.Set(f.Path, state.Entry{MTime: f.MTime, Size: f.Size})
+					s.manifest.Set(f.Path, state.Entry{MTime: f.MTime, Size: f.Size, LocalPath: adopted})
 					continue
 				}
 			}
@@ -492,13 +524,18 @@ func (s *Syncer) selectForDownload(remoteFiles []sftpclient.RemoteFile) (int, []
 
 func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile) error {
 	type result struct {
-		file sftpclient.RemoteFile
-		err  error
+		file      sftpclient.RemoteFile
+		localPath string
+		skipped   bool
+		err       error
 	}
 
 	results := make(chan result, len(files))
 	sem := make(chan struct{}, s.cfg.Sync.Workers)
 	var wg sync.WaitGroup
+
+	// One destination table per batch, so workers cannot choose the same path.
+	destinations := newBatchDestinations(s.manifest.Entries)
 
 	attempted := 0
 	for _, f := range files {
@@ -514,6 +551,21 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			defer func() { <-sem }()
 
 			s.setCurrentFile(f.Path)
+
+			// With no EXIF folder structure the destination does not depend on
+			// the file's contents, so a collision is settled before the transfer.
+			// That matters most for skipped files: without it, every poll would
+			// download a file only to discard it again.
+			if s.cfg.Sync.FolderStructure == "none" {
+				destination, skipped, err := destinations.resolve(
+					s.cfg.Sync.CollisionPolicy, f.Path, s.localPath(f.Path))
+				if skipped || err != nil {
+					s.recordSkipOrFailure(f.Path, err)
+					results <- result{file: f, skipped: skipped, err: err}
+					return
+				}
+				_ = destination // re-resolved below, which is idempotent
+			}
 
 			fp := &fileProgress{
 				total:    f.Size,
@@ -536,11 +588,20 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 
 			// Try to extract the capture date from EXIF metadata.
 			captureDate, exifErr := exif.Date(tmpPath)
-			var finalPath string
+			desired := s.localPath(f.Path)
 			if exifErr == nil {
-				finalPath = s.datePath(f.Path, captureDate)
-			} else {
-				finalPath = s.localPath(f.Path)
+				desired = s.datePath(f.Path, captureDate)
+			}
+
+			// Settle the destination before the final rename. Resolution is
+			// idempotent for a file that already holds a claim.
+			finalPath, skipped, err := destinations.resolve(
+				s.cfg.Sync.CollisionPolicy, f.Path, desired)
+			if skipped || err != nil {
+				os.Remove(tmpPath)
+				s.recordSkipOrFailure(f.Path, err)
+				results <- result{file: f, skipped: skipped, err: err}
+				return
 			}
 
 			// Ensure destination directory exists, then place the file.
@@ -570,7 +631,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			}
 
 			s.recordFileResult(f.Path, nil, fp.copied)
-			results <- result{file: f, err: nil}
+			results <- result{file: f, localPath: finalPath}
 		}(f)
 	}
 
@@ -590,10 +651,18 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			log.Printf("download failed %s: %v", r.file.Path, r.err)
 			continue
 		}
+		if r.skipped {
+			// A skipped file is deliberately absent from the manifest: it was
+			// not synced, and recording it would claim otherwise.
+			continue
+		}
 		log.Printf("synced: %s", r.file.Path)
 		s.manifest.Set(r.file.Path, state.Entry{
 			MTime: r.file.MTime,
 			Size:  r.file.Size,
+			// Record the destination that was actually used, so the next sync
+			// updates this file instead of choosing another name.
+			LocalPath: r.localPath,
 		})
 	}
 
