@@ -55,10 +55,14 @@ type SlotView struct {
 	CurrentFile string // "  IMG_0042.CR3 — 900.0 KB of 3.1 MB (28%)"
 	LastSuccess string // "  Last success: 2024-06-15 11:00"
 	Error       string // "  ⚠ copy failed: permission denied"
+	ActionError string // "  ⚠ pause failed: daemon unreachable"
 }
 
-// JobSlotView renders a job for the menu.
-func JobSlotView(j daemon.JobResponse) SlotView {
+// JobSlotView renders a job for the menu. actionError is the result of a
+// control request made from this slot, and is shown alongside the daemon's own
+// last error rather than replacing it: a failed pause and a failed sync are
+// different problems.
+func JobSlotView(j daemon.JobResponse, actionError string) SlotView {
 	st := j.Status
 	view := SlotView{
 		Header:      fmt.Sprintf("%s %s", StatusPrefix(st), JobDisplayName(j.ConfigPath)),
@@ -76,7 +80,44 @@ func JobSlotView(j daemon.JobResponse) SlotView {
 		// and a truncated error is the least useful thing to show.
 		view.Error = "  ⚠ " + st.LastError
 	}
+	if actionError != "" {
+		view.ActionError = "  ⚠ " + actionError
+	}
 	return view
+}
+
+// SlotControls describes which control rows a slot shows. A job offers Pause
+// while it is active and Resume while it is paused, never both.
+type SlotControls struct {
+	ShowPause  bool
+	ShowResume bool
+}
+
+// SlotControlsFor returns the controls appropriate to a job's paused state.
+func SlotControlsFor(paused bool) SlotControls {
+	return SlotControls{ShowPause: !paused, ShowResume: paused}
+}
+
+// ActionFailure renders a failed control request for display in the job's own
+// menu section, so a failure is visible rather than only logged.
+func ActionFailure(action string, err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s failed: %v", action, err)
+}
+
+// AdditionalJobsNotice reports jobs that do not fit in the menu. Hiding jobs
+// without saying so is not acceptable, so the menu states how many are missing.
+func AdditionalJobsNotice(total, shown int) string {
+	if total <= shown {
+		return ""
+	}
+	missing := total - shown
+	if missing == 1 {
+		return "1 additional job not shown"
+	}
+	return fmt.Sprintf("%d additional jobs not shown", missing)
 }
 
 // StatusPrefix summarises a job at a glance.

@@ -238,8 +238,17 @@ when a job has failed.
 The menu polls once a second while any job is scanning or downloading, and every
 30 seconds when every job is idle or paused, so an open menu is never more than
 two seconds out of date while work is happening and an inactive app stays quiet.
-`Refresh Status` fetches immediately; it does not start a sync. Use
-`sftpsync sync <id>` for that.
+`Refresh Status` fetches immediately; it does not start a sync.
+
+Each job has its own controls: `Pause` while it is active, `Resume` while it is
+paused, `Sync Now` to scan immediately, and `Remove Job…` last and clearly
+labelled because it is destructive. Controls are disabled while their request is
+in flight, and the menu refreshes as soon as it finishes. A failed action is
+shown in that job's own section rather than only being logged, alongside the
+daemon's latest sync error.
+
+The menu shows up to 10 jobs. If there are more, it says how many are not shown
+rather than hiding them silently.
 
 ## Roadmap
 
