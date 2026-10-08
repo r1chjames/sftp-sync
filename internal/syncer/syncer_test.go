@@ -1,6 +1,7 @@
 package syncer
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -141,6 +142,52 @@ func TestMarkFailurePreservesLastSuccessAndCounters(t *testing.T) {
 	st = s.Status()
 	if st.Phase != PhaseIdle || st.LastError != nil || st.LastSuccessfulSync.IsZero() {
 		t.Fatalf("success state incorrect: %+v", st)
+	}
+}
+
+func TestRecordCycle(t *testing.T) {
+	live := context.Background()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s := New(&config.Config{})
+	s.recordCycle(cancelled, errors.New("connect: context canceled"))
+	st := s.Status()
+	if st.Phase != PhaseIdle || st.LastError != nil || !st.LastSuccessfulSync.IsZero() {
+		t.Fatalf("cancelled cycle recorded a failure: %+v", st)
+	}
+
+	s.recordCycle(live, errors.New("walk /photos: boom"))
+	st = s.Status()
+	if st.Phase != PhaseError || st.LastError == nil || st.LastError.Error() != "walk /photos: boom" {
+		t.Fatalf("failed cycle not recorded: %+v", st)
+	}
+
+	s.recordCycle(live, nil)
+	st = s.Status()
+	if st.Phase != PhaseIdle || st.LastError != nil || st.LastSuccessfulSync.IsZero() {
+		t.Fatalf("successful cycle not recorded: %+v", st)
+	}
+}
+
+func TestBatchInterruptedError(t *testing.T) {
+	if err := batchInterruptedError(3, 3, context.Canceled); err != nil {
+		t.Fatalf("fully attempted batch error = %v, want nil", err)
+	}
+	if err := batchInterruptedError(1, 3, nil); err != nil {
+		t.Fatalf("live context error = %v, want nil", err)
+	}
+
+	err := batchInterruptedError(1, 3, context.Canceled)
+	if err == nil {
+		t.Fatal("interrupted batch returned nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("interrupted batch error %v does not wrap context.Canceled", err)
+	}
+	want := "batch interrupted: 2 of 3 file(s) not attempted: context canceled"
+	if err.Error() != want {
+		t.Fatalf("interrupted batch error = %q, want %q", err, want)
 	}
 }
 
