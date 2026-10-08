@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -110,14 +111,28 @@ func (d *Daemon) RemoveJob(id string) error {
 	return d.saveRegistry()
 }
 
-// ListJobs returns all current jobs.
+// ListJobs returns all current jobs in a stable order.
 func (d *Daemon) ListJobs() []*Job {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
 	jobs := make([]*Job, 0, len(d.jobs))
 	for _, j := range d.jobs {
 		jobs = append(jobs, j)
 	}
+	d.mu.RUnlock()
+
+	return sortJobs(jobs)
+}
+
+// sortJobs orders jobs by when they were added, then by ID. Jobs live in a
+// map, whose iteration order is random; clients poll the API for display, so
+// the order must not change between refreshes.
+func sortJobs(jobs []*Job) []*Job {
+	sort.Slice(jobs, func(i, k int) bool {
+		if !jobs[i].AddedAt.Equal(jobs[k].AddedAt) {
+			return jobs[i].AddedAt.Before(jobs[k].AddedAt)
+		}
+		return jobs[i].ID < jobs[k].ID
+	})
 	return jobs
 }
 
@@ -180,15 +195,20 @@ func (d *Daemon) loadRegistry() error {
 
 func (d *Daemon) saveRegistry() error {
 	d.mu.RLock()
-	var reg registryFile
+	jobs := make([]*Job, 0, len(d.jobs))
 	for _, j := range d.jobs {
+		jobs = append(jobs, j)
+	}
+	d.mu.RUnlock()
+
+	var reg registryFile
+	for _, j := range sortJobs(jobs) {
 		reg.Jobs = append(reg.Jobs, registryEntry{
 			ID:         j.ID,
 			ConfigPath: j.ConfigPath,
 			AddedAt:    j.AddedAt,
 		})
 	}
-	d.mu.RUnlock()
 
 	if err := os.MkdirAll(filepath.Dir(d.registryPath), 0755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)

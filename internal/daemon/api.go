@@ -31,14 +31,7 @@ func (d *Daemon) ServeAPI() error {
 	}
 	defer os.Remove(socketPath)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /jobs", d.handleListJobs)
-	mux.HandleFunc("POST /jobs", d.handleAddJob)
-	mux.HandleFunc("GET /jobs/{id}", d.handleGetJob)
-	mux.HandleFunc("DELETE /jobs/{id}", d.handleRemoveJob)
-	mux.HandleFunc("POST /shutdown", d.handleShutdown)
-
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: d.newMux()}
 	go func() {
 		<-d.ctx.Done()
 		srv.Shutdown(context.Background())
@@ -49,6 +42,18 @@ func (d *Daemon) ServeAPI() error {
 		return err
 	}
 	return nil
+}
+
+// newMux builds the daemon's HTTP routes. It is separate from ServeAPI so
+// tests can exercise the API without binding a Unix socket.
+func (d *Daemon) newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /jobs", d.handleListJobs)
+	mux.HandleFunc("POST /jobs", d.handleAddJob)
+	mux.HandleFunc("GET /jobs/{id}", d.handleGetJob)
+	mux.HandleFunc("DELETE /jobs/{id}", d.handleRemoveJob)
+	mux.HandleFunc("POST /shutdown", d.handleShutdown)
+	return mux
 }
 
 func (d *Daemon) handleListJobs(w http.ResponseWriter, r *http.Request) {
