@@ -52,6 +52,12 @@ sync:
   # again.
   collision_policy: rename
 
+  # How many times to attempt one file's transfer before reporting it failed.
+  # Retries wait with exponential backoff and jitter, and only failures that look
+  # transient (a dropped connection, a timeout, a truncated transfer) are
+  # retried. A file that fails is retried again on the next poll.
+  max_attempts: 3
+
 # Path for the state manifest (tracks what has been synced).
 # Defaults to ~/.local/share/sftpsync/manifest.json
 # state_path: ~/.local/share/sftpsync/manifest.json

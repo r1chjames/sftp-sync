@@ -35,6 +35,7 @@ type SyncConfig struct {
 	Extensions      []string      `yaml:"extensions"`
 	FolderStructure string        `yaml:"folder_structure"` // "none", "year", "year_month", or "year_month_day"
 	CollisionPolicy string        `yaml:"collision_policy"` // "error", "skip", or "rename"
+	MaxAttempts     int           `yaml:"max_attempts"`     // per-file transfer attempts, including the first
 }
 
 type Config struct {
@@ -111,6 +112,14 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("sync.collision_policy must be one of: %s, %s, %s",
 			CollisionError, CollisionSkip, CollisionRename)
+	}
+	if c.Sync.MaxAttempts == 0 {
+		// Three attempts survives a brief interruption without holding a worker
+		// on a dead server for long.
+		c.Sync.MaxAttempts = 3
+	}
+	if c.Sync.MaxAttempts < 1 || c.Sync.MaxAttempts > 10 {
+		return fmt.Errorf("sync.max_attempts must be between 1 and 10")
 	}
 	return nil
 }
