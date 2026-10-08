@@ -36,7 +36,7 @@ func (m *DaemonManager) EnsureRunning() error {
 		return fmt.Errorf("sftpsyncd not found: %w", err)
 	}
 
-	logPath := config.ExpandHome("~/.local/share/sftpsync/sftpsyncd.log")
+	logPath := daemonLogPath()
 	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
 		return fmt.Errorf("mkdir log dir: %w", err)
 	}
@@ -86,6 +86,12 @@ func (m *DaemonManager) Shutdown() {
 		log.Println("daemon did not exit in time, killing")
 		m.cmd.Process.Kill()
 	}
+}
+
+// daemonLogPath is where the daemon's output is captured when this app starts
+// it. The Open Daemon Log action reads the same path.
+func daemonLogPath() string {
+	return config.ExpandHome("~/.local/share/sftpsync/sftpsyncd.log")
 }
 
 func findDaemonBinary() (string, error) {

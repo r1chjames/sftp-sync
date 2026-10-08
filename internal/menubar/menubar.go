@@ -165,37 +165,151 @@ func attemptedFiles(st daemon.StatusResponse) int {
 	return attempted
 }
 
-// MenuTitle returns the text shown next to the menu-bar icon: the aggregate
-// percentage of every job currently downloading, and a warning marker when any
-// job has failed. Summing only downloading jobs keeps the percentage honest,
-// because a finished job's byte counters describe its last batch, not the work
-// in progress.
-func MenuTitle(jobs []daemon.JobResponse) string {
+// MenuState is the overall state the menu bar communicates.
+type MenuState string
+
+// Menu states, most urgent first.
+const (
+	StateIdle   MenuState = "idle"
+	StatePaused MenuState = "paused"
+	StateActive MenuState = "active"
+	StateError  MenuState = "error"
+)
+
+// MenuStatus is what the menu bar shows for the whole app.
+type MenuStatus struct {
+	State   MenuState
+	Title   string // shown beside the icon; "" leaves the icon alone
+	Tooltip string // shown on hover
+}
+
+// MenuStatusFor summarises every job.
+//
+// The state resolves to the most urgent thing happening: an error outranks
+// active transfers, which outrank a paused job, which outranks idle. The title
+// carries the aggregate percentage of jobs currently downloading, because byte
+// counters of a finished job describe its last batch, not the work in progress.
+func MenuStatusFor(jobs []daemon.JobResponse) MenuStatus {
 	var (
 		completed int64
 		total     int64
-		failed    bool
+		active    int
+		paused    int
+		failed    int
 	)
 
 	for _, j := range jobs {
-		if j.Status.LastError != "" {
-			failed = true
+		switch {
+		case j.Status.LastError != "":
+			failed++
+		case activePhases[j.Status.Phase]:
+			// A paused job that is still draining a batch is counted as active:
+			// files are still moving, and the settled state is what should be
+			// reported once it arrives.
+			active++
+		case j.Status.Paused:
+			paused++
 		}
-		if j.Status.Phase != "downloading" {
-			continue
+
+		if j.Status.Phase == "downloading" {
+			completed += j.Status.BytesCompleted
+			total += j.Status.BytesTotal
 		}
-		completed += j.Status.BytesCompleted
-		total += j.Status.BytesTotal
+	}
+
+	state := StateIdle
+	switch {
+	case failed > 0:
+		state = StateError
+	case active > 0:
+		state = StateActive
+	case paused > 0:
+		state = StatePaused
 	}
 
 	parts := make([]string, 0, 2)
+	switch state {
+	case StateError:
+		parts = append(parts, "⚠")
+	case StateActive:
+		parts = append(parts, "⟳")
+	case StatePaused:
+		parts = append(parts, "⏸")
+	}
 	if percent, ok := humanize.Percent(completed, total); ok {
 		parts = append(parts, fmt.Sprintf("%d%%", percent))
 	}
-	if failed {
-		parts = append(parts, "⚠")
+
+	return MenuStatus{
+		State:   state,
+		Title:   strings.Join(parts, " "),
+		Tooltip: menuTooltip(len(jobs), active, paused, failed),
 	}
-	return strings.Join(parts, " ")
+}
+
+func menuTooltip(jobs, active, paused, failed int) string {
+	if jobs == 0 {
+		return "sftpsync — no jobs"
+	}
+
+	parts := []string{fmt.Sprintf("%d %s", jobs, plural(jobs, "job", "jobs"))}
+	if active > 0 {
+		parts = append(parts, fmt.Sprintf("%d active", active))
+	}
+	if paused > 0 {
+		parts = append(parts, fmt.Sprintf("%d paused", paused))
+	}
+	if failed > 0 {
+		parts = append(parts, fmt.Sprintf("%d with errors", failed))
+	}
+	return "sftpsync — " + strings.Join(parts, ", ")
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// RevealableDestination returns the destination directory to reveal, or "" when
+// the job has none reported. An empty path is refused rather than passed to the
+// system opener, which would open an unrelated location.
+func RevealableDestination(j daemon.JobResponse) string {
+	if strings.TrimSpace(j.LocalPath) == "" {
+		return ""
+	}
+	return j.LocalPath
+}
+
+// RevealCommand returns the program and arguments used to reveal a path in the
+// desktop file manager.
+//
+// The path is a single argv entry and is never passed through a shell, so a path
+// containing spaces, quotes, or shell metacharacters cannot be interpreted as
+// additional commands.
+func RevealCommand(path string) (string, []string) {
+	return "open", []string{path}
+}
+
+// CopyCommand returns the program used to put text on the clipboard. The text is
+// written to the program's standard input, never as an argument or through a
+// shell.
+func CopyCommand() (string, []string) {
+	return "pbcopy", nil
+}
+
+// CopyableError returns the error text for a job, for copying to the clipboard:
+// the daemon's latest error and any failure from a menu action, one per line.
+func CopyableError(j daemon.JobResponse, actionError string) string {
+	lines := make([]string, 0, 2)
+	if j.Status.LastError != "" {
+		lines = append(lines, j.Status.LastError)
+	}
+	if actionError != "" {
+		lines = append(lines, actionError)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // JobDisplayName derives a short, human label from a config file path.

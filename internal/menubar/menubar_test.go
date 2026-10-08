@@ -222,26 +222,37 @@ func TestJobSlotViewWithError(t *testing.T) {
 	}
 }
 
-func TestMenuTitleAggregatesOnlyActiveDownloads(t *testing.T) {
+func TestMenuStatusFor(t *testing.T) {
 	tests := []struct {
-		name string
-		jobs []daemon.JobResponse
-		want string
+		name        string
+		jobs        []daemon.JobResponse
+		wantState   MenuState
+		wantTitle   string
+		wantTooltip string
 	}{
-		{name: "no jobs", want: ""},
 		{
-			name: "idle job keeps the icon alone",
+			name:        "no jobs",
+			wantState:   StateIdle,
+			wantTitle:   "",
+			wantTooltip: "sftpsync — no jobs",
+		},
+		{
+			name: "idle keeps the icon alone",
 			jobs: []daemon.JobResponse{job("a", daemon.StatusResponse{
 				Phase: "idle", BytesTotal: 1000, BytesCompleted: 1000,
 			})},
-			want: "",
+			wantState:   StateIdle,
+			wantTitle:   "",
+			wantTooltip: "sftpsync — 1 job",
 		},
 		{
 			name: "single download",
 			jobs: []daemon.JobResponse{job("a", daemon.StatusResponse{
 				Phase: "downloading", BytesTotal: 1000, BytesCompleted: 250,
 			})},
-			want: "25%",
+			wantState:   StateActive,
+			wantTitle:   "⟳ 25%",
+			wantTooltip: "sftpsync — 1 job, 1 active",
 		},
 		{
 			name: "two downloads are summed",
@@ -249,7 +260,9 @@ func TestMenuTitleAggregatesOnlyActiveDownloads(t *testing.T) {
 				job("a", daemon.StatusResponse{Phase: "downloading", BytesTotal: 1000, BytesCompleted: 500}),
 				job("b", daemon.StatusResponse{Phase: "downloading", BytesTotal: 3000, BytesCompleted: 500}),
 			},
-			want: "25%",
+			wantState:   StateActive,
+			wantTitle:   "⟳ 25%",
+			wantTooltip: "sftpsync — 2 jobs, 2 active",
 		},
 		{
 			name: "a completed job does not dilute the active total",
@@ -257,44 +270,195 @@ func TestMenuTitleAggregatesOnlyActiveDownloads(t *testing.T) {
 				job("a", daemon.StatusResponse{Phase: "downloading", BytesTotal: 1000, BytesCompleted: 500}),
 				job("b", daemon.StatusResponse{Phase: "idle", BytesTotal: 1000, BytesCompleted: 1000}),
 			},
-			want: "50%",
+			wantState:   StateActive,
+			wantTitle:   "⟳ 50%",
+			wantTooltip: "sftpsync — 2 jobs, 1 active",
 		},
 		{
-			name: "unknown totals stay unreported",
-			jobs: []daemon.JobResponse{job("a", daemon.StatusResponse{Phase: "downloading"})},
-			want: "",
+			name:        "scanning counts as active without a percentage",
+			jobs:        []daemon.JobResponse{job("a", daemon.StatusResponse{Phase: "scanning"})},
+			wantState:   StateActive,
+			wantTitle:   "⟳",
+			wantTooltip: "sftpsync — 1 job, 1 active",
 		},
 		{
-			name: "failure marker",
-			jobs: []daemon.JobResponse{job("a", daemon.StatusResponse{Phase: "error", LastError: "boom"})},
-			want: "⚠",
+			name:        "unknown totals stay unreported",
+			jobs:        []daemon.JobResponse{job("a", daemon.StatusResponse{Phase: "downloading"})},
+			wantState:   StateActive,
+			wantTitle:   "⟳",
+			wantTooltip: "sftpsync — 1 job, 1 active",
 		},
 		{
-			name: "failure marker beside progress",
+			name:        "paused",
+			jobs:        []daemon.JobResponse{job("a", daemon.StatusResponse{Phase: "paused", Paused: true})},
+			wantState:   StatePaused,
+			wantTitle:   "⏸",
+			wantTooltip: "sftpsync — 1 job, 1 paused",
+		},
+		{
+			name: "paused while draining still counts as active",
+			jobs: []daemon.JobResponse{job("a", daemon.StatusResponse{
+				Phase: "downloading", Paused: true, BytesTotal: 100, BytesCompleted: 10,
+			})},
+			wantState:   StateActive,
+			wantTitle:   "⟳ 10%",
+			wantTooltip: "sftpsync — 1 job, 1 active",
+		},
+		{
+			name:        "error",
+			jobs:        []daemon.JobResponse{job("a", daemon.StatusResponse{Phase: "error", LastError: "boom"})},
+			wantState:   StateError,
+			wantTitle:   "⚠",
+			wantTooltip: "sftpsync — 1 job, 1 with errors",
+		},
+		{
+			name: "error outranks an active transfer and keeps its percentage",
 			jobs: []daemon.JobResponse{
 				job("a", daemon.StatusResponse{Phase: "downloading", BytesTotal: 100, BytesCompleted: 10}),
 				job("b", daemon.StatusResponse{Phase: "error", LastError: "boom"}),
 			},
-			want: "10% ⚠",
+			wantState:   StateError,
+			wantTitle:   "⚠ 10%",
+			wantTooltip: "sftpsync — 2 jobs, 1 active, 1 with errors",
+		},
+		{
+			name: "error outranks a pause",
+			jobs: []daemon.JobResponse{
+				job("a", daemon.StatusResponse{Phase: "paused", Paused: true}),
+				job("b", daemon.StatusResponse{Phase: "error", LastError: "boom"}),
+			},
+			wantState:   StateError,
+			wantTitle:   "⚠",
+			wantTooltip: "sftpsync — 2 jobs, 1 paused, 1 with errors",
 		},
 		{
 			name: "overshoot cannot exceed one hundred percent",
 			jobs: []daemon.JobResponse{job("a", daemon.StatusResponse{
 				Phase: "downloading", BytesTotal: 100, BytesCompleted: 9999,
 			})},
-			want: "100%",
+			wantState:   StateActive,
+			wantTitle:   "⟳ 100%",
+			wantTooltip: "sftpsync — 1 job, 1 active",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := MenuTitle(tt.jobs); got != tt.want {
-				t.Fatalf("MenuTitle() = %q, want %q", got, tt.want)
+			got := MenuStatusFor(tt.jobs)
+
+			if got.State != tt.wantState {
+				t.Fatalf("state = %q, want %q", got.State, tt.wantState)
+			}
+			if got.Title != tt.wantTitle {
+				t.Fatalf("title = %q, want %q", got.Title, tt.wantTitle)
+			}
+			if got.Tooltip != tt.wantTooltip {
+				t.Fatalf("tooltip = %q, want %q", got.Tooltip, tt.wantTooltip)
 			}
 		})
 	}
 }
 
+func TestRevealableDestination(t *testing.T) {
+	tests := []struct {
+		name      string
+		localPath string
+		want      string
+	}{
+		{name: "no path from the daemon", localPath: "", want: ""},
+		{name: "whitespace only", localPath: "   ", want: ""},
+		{name: "a path", localPath: "/Volumes/Photos", want: "/Volumes/Photos"},
+		{name: "a path with spaces and metacharacters", localPath: "/Volumes/My Photos; rm -rf /", want: "/Volumes/My Photos; rm -rf /"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			j := daemon.JobResponse{LocalPath: tt.localPath}
+			if got := RevealableDestination(j); got != tt.want {
+				t.Fatalf("RevealableDestination() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRevealCommandNeverUsesAShell pins the safety property the issue calls out:
+// the path is one argv entry handed straight to the opener, so no
+// user-controlled text is ever interpreted by a shell.
+func TestRevealCommandNeverUsesAShell(t *testing.T) {
+	hostile := []string{
+		"/Volumes/My Photos",
+		"/tmp/; rm -rf /",
+		"/tmp/$(whoami)",
+		"/tmp/`id`",
+		"/tmp/a && b",
+		"/tmp/a | b",
+		"/tmp/it's",
+		"/tmp/a\nb",
+	}
+
+	for _, path := range hostile {
+		t.Run(path, func(t *testing.T) {
+			name, args := RevealCommand(path)
+
+			if name != "open" {
+				t.Fatalf("program = %q, want %q", name, "open")
+			}
+			if name == "sh" || name == "bash" || name == "zsh" || name == "-c" {
+				t.Fatalf("program = %q, want no shell", name)
+			}
+			if len(args) != 1 {
+				t.Fatalf("args = %q, want exactly one argument", args)
+			}
+			if args[0] != path {
+				t.Fatalf("args[0] = %q, want the path unmodified (%q)", args[0], path)
+			}
+			for _, arg := range args {
+				if strings.Contains(arg, "-c") {
+					t.Fatalf("args = %q, want no command string", args)
+				}
+			}
+		})
+	}
+}
+
+func TestCopyCommand(t *testing.T) {
+	name, args := CopyCommand()
+
+	if name != "pbcopy" {
+		t.Fatalf("program = %q, want %q", name, "pbcopy")
+	}
+	if len(args) != 0 {
+		t.Fatalf("args = %q, want the text on stdin instead", args)
+	}
+}
+
+func TestCopyableError(t *testing.T) {
+	tests := []struct {
+		name        string
+		lastError   string
+		actionError string
+		want        string
+	}{
+		{name: "nothing to copy"},
+		{name: "daemon error only", lastError: "connect: permission denied", want: "connect: permission denied"},
+		{name: "action failure only", actionError: "pause failed: no daemon", want: "pause failed: no daemon"},
+		{
+			name:        "both, one per line",
+			lastError:   "connect: permission denied",
+			actionError: "pause failed: no daemon",
+			want:        "connect: permission denied\npause failed: no daemon",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			j := daemon.JobResponse{Status: daemon.StatusResponse{LastError: tt.lastError}}
+			if got := CopyableError(j, tt.actionError); got != tt.want {
+				t.Fatalf("CopyableError() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 func TestJobDisplayName(t *testing.T) {
 	tests := map[string]string{
 		"/home/me/photos.yaml":            "photos",

@@ -86,6 +86,7 @@ func (d *Daemon) AddJob(configPath string) (*Job, error) {
 		ID:         id,
 		ConfigPath: configPath,
 		AddedAt:    time.Now(),
+		LocalPath:  cfg.LocalPath,
 		syncer:     s,
 	}
 
@@ -222,6 +223,7 @@ func (d *Daemon) loadRegistry() error {
 			ID:         entry.ID,
 			ConfigPath: entry.ConfigPath,
 			AddedAt:    entry.AddedAt,
+			LocalPath:  cfg.LocalPath,
 			syncer:     s,
 		}
 		log.Printf("restored job %s (%s)", entry.ID, entry.ConfigPath)

@@ -40,6 +40,7 @@ func TestJobToResponseWithoutLastError(t *testing.T) {
 		ID:         "abc12345",
 		ConfigPath: "/tmp/photos.yaml",
 		AddedAt:    addedAt,
+		LocalPath:  "/Volumes/Photos",
 		syncer: &stubJobSyncer{status: syncer.SyncStatus{
 			Phase:         syncer.PhaseIdle,
 			FilesTotal:    12,
@@ -50,6 +51,11 @@ func TestJobToResponseWithoutLastError(t *testing.T) {
 	got := job.toResponse()
 	if got.ID != job.ID || got.ConfigPath != job.ConfigPath || !got.AddedAt.Equal(addedAt) {
 		t.Fatalf("job identity not mapped: %+v", got)
+	}
+	// The destination is exposed read-only so clients such as the menu-bar app
+	// can reveal it without parsing the config file themselves.
+	if got.LocalPath != "/Volumes/Photos" {
+		t.Fatalf("local path = %q, want %q", got.LocalPath, "/Volumes/Photos")
 	}
 	if got.Status.Phase != "idle" || got.Status.FilesTotal != 12 || got.Status.EligibleFiles != 12 {
 		t.Fatalf("status not mapped: %+v", got.Status)
