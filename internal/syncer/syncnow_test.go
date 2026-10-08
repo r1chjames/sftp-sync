@@ -211,10 +211,22 @@ func TestSyncNowDoesNotBlockWithoutListener(t *testing.T) {
 
 func TestSyncNowBeforeStartDoesNotPanic(t *testing.T) {
 	s := testSyncer(t, time.Hour)
+	entered := make(chan struct{}, 4)
+	s.syncFn = func(context.Context) error {
+		entered <- struct{}{}
+		return nil
+	}
+
 	s.SyncNow()
 	s.SyncNow()
-	if err := s.Start(context.Background()); err != nil {
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+
+	// Requests buffered before Start do not prevent the startup cycle.
+	waitForSignal(t, entered, "startup cycle")
 	s.Stop()
 }

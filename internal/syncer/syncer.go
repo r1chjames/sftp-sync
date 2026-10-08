@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -26,6 +27,11 @@ const (
 	PhasePaused      SyncPhase = "paused"
 	PhaseError       SyncPhase = "error"
 )
+
+// errBatchPaused reports that a download batch stopped early because the job
+// was paused. It is neither a success nor a failure: files that were already
+// copying have been committed, and the rest stay pending for the next resume.
+var errBatchPaused = errors.New("download batch paused")
 
 // byteProgressInterval throttles byte-progress status updates so the status
 // mutex is not taken for every 32 KiB write of every worker.
@@ -60,8 +66,13 @@ type Syncer struct {
 
 	mu     sync.RWMutex
 	status SyncStatus
+	paused bool
 	cancel context.CancelFunc
 	done   chan struct{}
+
+	// pauseCh wakes the run loop so it can reflect the paused state without
+	// waiting out the current interval.
+	pauseCh chan struct{}
 
 	// syncNow carries coalesced immediate-sync requests. A buffered channel of
 	// capacity one means any number of requests made while a cycle is running
@@ -80,9 +91,69 @@ func New(cfg *config.Config) *Syncer {
 		status:  SyncStatus{Phase: PhaseIdle},
 		done:    make(chan struct{}),
 		syncNow: make(chan struct{}, 1),
+		pauseCh: make(chan struct{}, 1),
 	}
 	s.syncFn = s.sync
 	return s
+}
+
+// Pause stops the job from starting new scans or downloads. A cycle that is
+// already running is allowed to finish: files being copied are committed
+// atomically, and files not yet started are left for the next resume. The
+// status becomes paused once no cycle is running. Pause is idempotent.
+func (s *Syncer) Pause() {
+	s.mu.Lock()
+	if s.paused {
+		s.mu.Unlock()
+		return
+	}
+	s.paused = true
+	s.mu.Unlock()
+
+	// Wake the loop so a job waiting out its interval becomes paused now
+	// rather than at the next tick.
+	select {
+	case s.pauseCh <- struct{}{}:
+	default:
+	}
+}
+
+// Resume clears the paused state and requests an immediate scan. Resume is
+// idempotent.
+func (s *Syncer) Resume() {
+	s.mu.Lock()
+	if !s.paused {
+		s.mu.Unlock()
+		return
+	}
+	s.paused = false
+	s.mu.Unlock()
+
+	s.SyncNow()
+}
+
+// IsPaused reports whether the job is paused.
+func (s *Syncer) IsPaused() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.paused
+}
+
+// markPaused publishes the paused phase and clears the in-flight file fields,
+// because nothing is being transferred while paused.
+func (s *Syncer) markPaused() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Phase = PhasePaused
+	s.status.CurrentFile = ""
+	s.status.CurrentFileBytesTotal = 0
+	s.status.CurrentFileBytesCompleted = 0
+}
+
+// shouldStopSubmitting reports whether a running download batch must stop
+// taking on new files. Files already copying always finish.
+func (s *Syncer) shouldStopSubmitting(ctx context.Context) bool {
+	return ctx.Err() != nil || s.IsPaused()
 }
 
 // SyncNow requests an immediate sync cycle instead of waiting for the next
@@ -286,6 +357,10 @@ func (s *Syncer) recordCycle(ctx context.Context, err error) {
 	switch {
 	case err == nil:
 		s.markSuccess()
+	case errors.Is(err, errBatchPaused):
+		// Neither a success nor a failure: the remaining files stay pending
+		// and are picked up after resume. The run loop sets the paused phase.
+		log.Printf("sync paused: %v", err)
 	case ctx.Err() != nil:
 		log.Printf("sync interrupted: %v", err)
 	default:
@@ -310,6 +385,7 @@ func (s *Syncer) run(ctx context.Context) {
 			return
 		case <-timer.C:
 		case <-s.syncNow:
+		case <-s.pauseCh:
 		}
 
 		// The timer is not needed while the cycle runs. Its pending value was
@@ -321,7 +397,21 @@ func (s *Syncer) run(ctx context.Context) {
 			}
 		}
 
+		// Never start new work while paused. Resume sends a SyncNow request,
+		// and shutdown cancels the context, so waiting here is safe.
+		if s.IsPaused() {
+			s.markPaused()
+			continue
+		}
+
 		s.recordCycle(ctx, s.syncFn(ctx))
+
+		// A pause that arrived while this cycle ran takes effect now, without
+		// scheduling another cycle.
+		if s.IsPaused() {
+			s.markPaused()
+			continue
+		}
 
 		// A request that arrived while the cycle ran is served immediately;
 		// otherwise wait a full interval.
@@ -409,7 +499,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 
 	attempted := 0
 	for _, f := range files {
-		if ctx.Err() != nil {
+		if s.shouldStopSubmitting(ctx) {
 			break
 		}
 
@@ -511,17 +601,21 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 	if err := downloadBatchError(failed, len(files), firstFailure.file.Path, firstFailure.err); err != nil {
 		return err
 	}
-	return batchInterruptedError(attempted, len(files), ctx.Err())
+	return incompleteBatchError(attempted, len(files), ctx.Err())
 }
 
-// batchInterruptedError reports a batch that could not be attempted in full
-// because the context was cancelled. A batch that attempted every file is not
-// an error even when cancellation arrives while the last worker finishes.
-func batchInterruptedError(attempted, total int, ctxErr error) error {
-	if ctxErr == nil || attempted >= total {
+// incompleteBatchError describes a batch that stopped before every file was
+// attempted. A batch that attempted every file is never an error, even when
+// cancellation arrives while the last worker finishes. With a live context the
+// stop was caused by a pause, which is not a failure.
+func incompleteBatchError(attempted, total int, ctxErr error) error {
+	if attempted >= total {
 		return nil
 	}
-	return fmt.Errorf("batch interrupted: %d of %d file(s) not attempted: %w", total-attempted, total, ctxErr)
+	if ctxErr != nil {
+		return fmt.Errorf("batch interrupted: %d of %d file(s) not attempted: %w", total-attempted, total, ctxErr)
+	}
+	return errBatchPaused
 }
 
 func downloadBatchError(failed, total int, firstPath string, firstErr error) error {
