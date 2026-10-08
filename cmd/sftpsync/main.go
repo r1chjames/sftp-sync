@@ -1,171 +1,272 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"text/tabwriter"
+	"time"
 
 	"github.com/r1chjames/sftp-sync/internal/apiclient"
 	"github.com/r1chjames/sftp-sync/internal/daemon"
 )
 
-func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
-	}
+// Exit codes. Usage errors are separated from request failures so scripts can
+// tell "you called it wrong" from "the daemon said no".
+const (
+	exitOK      = 0
+	exitFailure = 1
+	exitUsage   = 2
+)
 
-	c := apiclient.New()
-
-	switch os.Args[1] {
-	case "add":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: sftpsync add <config-file>")
-			os.Exit(1)
-		}
-		cmdAdd(c, os.Args[2])
-	case "list", "ls":
-		cmdList(c)
-	case "remove", "rm":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: sftpsync remove <id>")
-			os.Exit(1)
-		}
-		cmdRemove(c, os.Args[2])
-	case "status":
-		id := ""
-		if len(os.Args) >= 3 {
-			id = os.Args[2]
-		}
-		cmdStatus(c, id)
-	case "stop":
-		cmdStop(c)
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
-		usage()
-		os.Exit(1)
-	}
+// jobClient is the slice of the API client the CLI uses, so command dispatch
+// can be tested without a daemon.
+type jobClient interface {
+	AddJob(configPath string) (daemon.JobResponse, error)
+	ListJobs() ([]daemon.JobResponse, error)
+	RemoveJob(id string) error
+	SyncJob(id string) (daemon.JobResponse, error)
+	PauseJob(id string) (daemon.JobResponse, error)
+	ResumeJob(id string) (daemon.JobResponse, error)
+	Shutdown() error
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, `usage: sftpsync <command> [args]
+const usageText = `usage: sftpsync <command> [args]
 
 commands:
   add <config-file>   submit a new sync job
   list                list all jobs
   status [<id>]       show job status (all jobs if no id given)
+  sync <id>           scan and download now
+  pause <id>          stop starting new scans and downloads
+  resume <id>         clear the paused state and scan immediately
   remove <id>         stop and remove a job
-  stop                shut down the daemon`)
+  stop                shut down the daemon
+
+exit codes:
+  0 success, 1 request failed, 2 invalid command line
+`
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, apiclient.New()))
 }
 
-func cmdAdd(c *apiclient.Client, configPath string) {
-	abs, err := filepath.Abs(configPath)
-	if err != nil {
-		fatalf("resolve path: %v", err)
+// run dispatches a command line and returns the process exit code. It is
+// separate from main so argument validation and output can be tested without
+// calling os.Exit.
+func run(args []string, stdout, stderr io.Writer, c jobClient) int {
+	if len(args) == 0 {
+		fmt.Fprint(stderr, usageText)
+		return exitUsage
 	}
-	job, err := c.AddJob(abs)
-	if err != nil {
-		fatalf("%v", err)
+
+	command := args[0]
+	hasArg := len(args) > 1
+
+	switch command {
+	case "add":
+		if !hasArg {
+			return usageError(stderr, "add <config-file>")
+		}
+		abs, err := filepath.Abs(args[1])
+		if err != nil {
+			return failedf(stderr, "resolve path: %v", err)
+		}
+		job, err := c.AddJob(abs)
+		if err != nil {
+			return failedf(stderr, "%s", failureMessage(err))
+		}
+		fmt.Fprintf(stdout, "added job %s\n", job.ID)
+		return exitOK
+
+	case "list", "ls":
+		jobs, err := c.ListJobs()
+		if err != nil {
+			return failedf(stderr, "%s", failureMessage(err))
+		}
+		printJobList(stdout, jobs)
+		return exitOK
+
+	case "status":
+		return runStatus(c, args[1:], stdout, stderr)
+
+	case "sync", "pause", "resume":
+		if !hasArg {
+			return usageError(stderr, command+" <id>")
+		}
+		job, err := controlJob(c, command, args[1])
+		if err != nil {
+			return failedf(stderr, "%s", failureMessage(err))
+		}
+		fmt.Fprintf(stdout, "%s requested for job %s\n", command, job.ID)
+		return exitOK
+
+	case "remove", "rm":
+		if !hasArg {
+			return usageError(stderr, "remove <id>")
+		}
+		if err := c.RemoveJob(args[1]); err != nil {
+			return failedf(stderr, "%s", failureMessage(err))
+		}
+		fmt.Fprintf(stdout, "removed job %s\n", args[1])
+		return exitOK
+
+	case "stop":
+		if err := c.Shutdown(); err != nil {
+			return failedf(stderr, "%s", failureMessage(err))
+		}
+		fmt.Fprintln(stdout, "daemon shutting down")
+		return exitOK
+
+	default:
+		fmt.Fprintf(stderr, "unknown command: %s\n", command)
+		fmt.Fprint(stderr, usageText)
+		return exitUsage
 	}
-	fmt.Printf("added job %s\n", job.ID)
 }
 
-func cmdList(c *apiclient.Client) {
+func controlJob(c jobClient, action, id string) (daemon.JobResponse, error) {
+	switch action {
+	case "sync":
+		return c.SyncJob(id)
+	case "pause":
+		return c.PauseJob(id)
+	case "resume":
+		return c.ResumeJob(id)
+	}
+	return daemon.JobResponse{}, fmt.Errorf("unsupported command: %s", action)
+}
+
+func runStatus(c jobClient, args []string, stdout, stderr io.Writer) int {
 	jobs, err := c.ListJobs()
 	if err != nil {
-		fatalf("cannot reach daemon (is it running?): %v", err)
+		return failedf(stderr, "%s", failureMessage(err))
 	}
+
+	if len(args) > 0 {
+		id := args[0]
+		for _, j := range jobs {
+			if j.ID == id {
+				printJobDetail(stdout, j)
+				return exitOK
+			}
+		}
+		return failedf(stderr, "job %s not found", id)
+	}
+
 	if len(jobs) == 0 {
-		fmt.Println("no jobs")
+		fmt.Fprintln(stdout, "no jobs")
+		return exitOK
+	}
+	for i, j := range jobs {
+		if i > 0 {
+			fmt.Fprintln(stdout)
+		}
+		printJobDetail(stdout, j)
+	}
+	return exitOK
+}
+
+func usageError(stderr io.Writer, usage string) int {
+	fmt.Fprintf(stderr, "usage: sftpsync %s\n", usage)
+	return exitUsage
+}
+
+func failedf(stderr io.Writer, format string, a ...any) int {
+	fmt.Fprintf(stderr, format+"\n", a...)
+	return exitFailure
+}
+
+// failureMessage adds context for the two common failure modes: a daemon that
+// is not running, and a job that does not exist.
+func failureMessage(err error) string {
+	var unreachable *apiclient.UnreachableError
+	if errors.As(err, &unreachable) {
+		return fmt.Sprintf("cannot reach daemon (is it running?): %v", err)
+	}
+	return err.Error()
+}
+
+func printJobList(w io.Writer, jobs []daemon.JobResponse) {
+	if len(jobs) == 0 {
+		fmt.Fprintln(w, "no jobs")
 		return
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tPHASE\tCONFIG\tLAST SYNC\tFILES\tBATCH\tERROR")
 	for _, j := range jobs {
-		lastSync := "never"
-		if !j.Status.LastSync.IsZero() {
-			lastSync = j.Status.LastSync.Format("2006-01-02 15:04:05")
-		}
 		errStr := j.Status.LastError
 		if errStr == "" {
 			errStr = "-"
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
-			j.ID, j.Status.Phase, j.ConfigPath, lastSync, j.Status.FilesTotal,
-			formatBatch(j.Status), errStr)
+			j.ID, phaseLabel(j.Status), j.ConfigPath, formatTime(j.Status.LastSync),
+			j.Status.FilesTotal, formatBatch(j.Status), errStr)
 	}
 	tw.Flush()
 }
 
-func cmdStatus(c *apiclient.Client, id string) {
-	jobs, err := c.ListJobs()
-	if err != nil {
-		fatalf("cannot reach daemon (is it running?): %v", err)
-	}
-	if id != "" {
-		for _, j := range jobs {
-			if j.ID == id {
-				printJobDetail(j)
-				return
-			}
-		}
-		fatalf("job %s not found", id)
-		return
-	}
-	if len(jobs) == 0 {
-		fmt.Println("no jobs")
-		return
-	}
-	for i, j := range jobs {
-		printJobDetail(j)
-		if i < len(jobs)-1 {
-			fmt.Println()
-		}
+func printJobDetail(w io.Writer, j daemon.JobResponse) {
+	for _, line := range jobDetailLines(j) {
+		fmt.Fprintln(w, line)
 	}
 }
 
-func cmdRemove(c *apiclient.Client, id string) {
-	if err := c.RemoveJob(id); err != nil {
-		fatalf("%v", err)
+// jobDetailLines renders a job's status as label/value lines. It is pure so the
+// formatting can be tested without capturing stdout.
+func jobDetailLines(j daemon.JobResponse) []string {
+	lines := []string{
+		fmt.Sprintf("id:            %s", j.ID),
+		fmt.Sprintf("config:        %s", j.ConfigPath),
+		fmt.Sprintf("added:         %s", formatTime(j.AddedAt)),
+		fmt.Sprintf("phase:         %s", phaseLabel(j.Status)),
+		fmt.Sprintf("paused:        %s", yesNo(j.Status.Paused)),
+		fmt.Sprintf("last sync:     %s", formatTime(j.Status.LastSync)),
+		fmt.Sprintf("last success:  %s", formatTime(j.Status.LastSuccessfulSync)),
+		fmt.Sprintf("files:         %d", j.Status.FilesTotal),
+		fmt.Sprintf("eligible:      %d", j.Status.EligibleFiles),
+		fmt.Sprintf("batch:         %s", formatBatch(j.Status)),
+		fmt.Sprintf("bytes:         %s", formatByteProgress(j.Status)),
 	}
-	fmt.Printf("removed job %s\n", id)
-}
 
-func cmdStop(c *apiclient.Client) {
-	if err := c.Shutdown(); err != nil {
-		fatalf("cannot reach daemon (is it running?): %v", err)
-	}
-	fmt.Println("daemon shutting down")
-}
-
-func printJobDetail(j daemon.JobResponse) {
-	lastSync := "never"
-	if !j.Status.LastSync.IsZero() {
-		lastSync = j.Status.LastSync.Format("2006-01-02 15:04:05")
-	}
-	lastSuccessfulSync := "never"
-	if !j.Status.LastSuccessfulSync.IsZero() {
-		lastSuccessfulSync = j.Status.LastSuccessfulSync.Format("2006-01-02 15:04:05")
-	}
-	fmt.Printf("id:           %s\n", j.ID)
-	fmt.Printf("config:       %s\n", j.ConfigPath)
-	fmt.Printf("added:        %s\n", j.AddedAt.Format("2006-01-02 15:04:05"))
-	fmt.Printf("phase:        %s\n", j.Status.Phase)
-	fmt.Printf("last sync:    %s\n", lastSync)
-	fmt.Printf("last success: %s\n", lastSuccessfulSync)
-	fmt.Printf("files:        %d\n", j.Status.FilesTotal)
-	fmt.Printf("batch:        %s\n", formatBatch(j.Status))
-	fmt.Printf("bytes:        %s\n", formatByteProgress(j.Status))
 	if !j.Status.StartedAt.IsZero() {
-		fmt.Printf("started:      %s\n", j.Status.StartedAt.Format("2006-01-02 15:04:05"))
+		lines = append(lines, fmt.Sprintf("batch started: %s", formatTime(j.Status.StartedAt)))
 	}
 	if j.Status.CurrentFile != "" {
-		fmt.Printf("current:      %s\n", j.Status.CurrentFile)
+		lines = append(lines, fmt.Sprintf("current file:  %s", j.Status.CurrentFile))
+		lines = append(lines, fmt.Sprintf("current bytes: %s",
+			formatBytePair(j.Status.CurrentFileBytesCompleted, j.Status.CurrentFileBytesTotal)))
 	}
 	if j.Status.LastError != "" {
-		fmt.Printf("error:        %s\n", j.Status.LastError)
+		lines = append(lines, fmt.Sprintf("error:         %s", j.Status.LastError))
 	}
+	return lines
+}
+
+// phaseLabel shows the paused state alongside the phase, because a paused job
+// that is draining a batch still reports the downloading phase.
+func phaseLabel(status daemon.StatusResponse) string {
+	if status.Paused && status.Phase != "paused" {
+		return status.Phase + " (paused)"
+	}
+	return status.Phase
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+// formatTime renders a timestamp, or "never" when it is unset.
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return t.Format("2006-01-02 15:04:05")
 }
 
 func formatBatch(status daemon.StatusResponse) string {
@@ -191,25 +292,24 @@ func formatBytes(n int64) string {
 	return fmt.Sprintf("%.1f %s", value, units[i])
 }
 
-// formatByteProgress renders batch byte progress as a percentage, or "-" when
-// the batch size is not yet known. Completed bytes are clamped so a remote file
-// that grew mid-transfer cannot report more than 100%.
-func formatByteProgress(status daemon.StatusResponse) string {
-	if status.BytesTotal <= 0 {
+// formatBytePair renders progress as a percentage, or "-" when the total is not
+// yet known. Completed bytes are clamped so a remote file that grew mid-transfer
+// cannot report more than 100%.
+func formatBytePair(completed, total int64) string {
+	if total <= 0 {
 		return "-"
 	}
-	completed := status.BytesCompleted
-	if completed > status.BytesTotal {
-		completed = status.BytesTotal
+	if completed > total {
+		completed = total
 	}
 	if completed < 0 {
 		completed = 0
 	}
-	percent := completed * 100 / status.BytesTotal
-	return fmt.Sprintf("%s of %s (%d%%)", formatBytes(completed), formatBytes(status.BytesTotal), percent)
+	percent := completed * 100 / total
+	return fmt.Sprintf("%s of %s (%d%%)", formatBytes(completed), formatBytes(total), percent)
 }
 
-func fatalf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
-	os.Exit(1)
+// formatByteProgress renders batch byte progress.
+func formatByteProgress(status daemon.StatusResponse) string {
+	return formatBytePair(status.BytesCompleted, status.BytesTotal)
 }

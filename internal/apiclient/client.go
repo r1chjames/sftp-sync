@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -50,9 +51,47 @@ func responseError(resp *http.Response) error {
 	return fmt.Errorf("daemon error (%d): %s", resp.StatusCode, msg)
 }
 
+// UnreachableError reports that the daemon could not be contacted at all, as
+// opposed to answering with an error status. Callers use it to tell "the daemon
+// said no" apart from "the daemon is not there".
+type UnreachableError struct {
+	Err error
+}
+
+func (e *UnreachableError) Error() string { return e.Err.Error() }
+func (e *UnreachableError) Unwrap() error { return e.Err }
+
+// do performs a request, classifying transport failures.
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, &UnreachableError{Err: err}
+	}
+	return resp, nil
+}
+
+func (c *Client) get(url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.do(req)
+}
+
+func (c *Client) post(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return c.do(req)
+}
+
 // Ping returns nil if the daemon is reachable and serving the API.
 func (c *Client) Ping() error {
-	resp, err := c.http.Get(c.baseURL + "/jobs")
+	resp, err := c.get(c.baseURL + "/jobs")
 	if err != nil {
 		return err
 	}
@@ -64,7 +103,7 @@ func (c *Client) Ping() error {
 }
 
 func (c *Client) ListJobs() ([]daemon.JobResponse, error) {
-	resp, err := c.http.Get(c.baseURL + "/jobs")
+	resp, err := c.get(c.baseURL + "/jobs")
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +120,7 @@ func (c *Client) ListJobs() ([]daemon.JobResponse, error) {
 
 func (c *Client) AddJob(configPath string) (daemon.JobResponse, error) {
 	body, _ := json.Marshal(map[string]string{"config_path": configPath})
-	resp, err := c.http.Post(c.baseURL+"/jobs", "application/json", bytes.NewReader(body))
+	resp, err := c.post(c.baseURL+"/jobs", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return daemon.JobResponse{}, err
 	}
@@ -115,7 +154,7 @@ func (c *Client) ResumeJob(id string) (daemon.JobResponse, error) {
 // jobAction posts an asynchronous control action and returns the job status
 // accepted by the daemon.
 func (c *Client) jobAction(id, action string) (daemon.JobResponse, error) {
-	resp, err := c.http.Post(c.baseURL+"/jobs/"+id+"/"+action, "", nil)
+	resp, err := c.post(c.baseURL+"/jobs/"+id+"/"+action, "", nil)
 	if err != nil {
 		return daemon.JobResponse{}, err
 	}
@@ -140,7 +179,7 @@ func (c *Client) RemoveJob(id string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return err
 	}
@@ -155,7 +194,7 @@ func (c *Client) RemoveJob(id string) error {
 }
 
 func (c *Client) Shutdown() error {
-	resp, err := c.http.Post(c.baseURL+"/shutdown", "", nil)
+	resp, err := c.post(c.baseURL+"/shutdown", "", nil)
 	if err != nil {
 		return err
 	}
