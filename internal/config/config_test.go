@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,55 @@ func baseConfig() *Config {
 			Interval: 60 * time.Second,
 			Workers:  4,
 		},
+	}
+}
+
+func TestValidate_Interval(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   time.Duration
+		wantErr bool
+	}{
+		{name: "positive interval is accepted", value: time.Minute},
+		{name: "zero interval is rejected", value: 0, wantErr: true},
+		{name: "negative interval is rejected", value: -time.Second, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Sync.Interval = tt.value
+			err := cfg.validate()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+				if !strings.Contains(err.Error(), "sync.interval") {
+					t.Fatalf("error = %v, want sync.interval", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadDefaultsInterval(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	contents := "sftp:\n  host: example.com\n  user: test\n  remote_path: /photos\nlocal_path: /tmp/sync\n"
+	if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Sync.Interval != 60*time.Second {
+		t.Fatalf("interval = %v, want 60s", cfg.Sync.Interval)
 	}
 }
 

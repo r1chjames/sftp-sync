@@ -9,13 +9,13 @@ import (
 )
 
 type SFTPConfig struct {
-	Host                 string `yaml:"host"`
-	Port                 int    `yaml:"port"`
-	User                 string `yaml:"user"`
-	Password             string `yaml:"password"`
-	KeyPath              string `yaml:"key_path"`
-	RemotePath           string `yaml:"remote_path"`
-	InsecureIgnoreHostKey bool  `yaml:"insecure_ignore_host_key"`
+	Host                  string `yaml:"host"`
+	Port                  int    `yaml:"port"`
+	User                  string `yaml:"user"`
+	Password              string `yaml:"password"`
+	KeyPath               string `yaml:"key_path"`
+	RemotePath            string `yaml:"remote_path"`
+	InsecureIgnoreHostKey bool   `yaml:"insecure_ignore_host_key"`
 }
 
 type SyncConfig struct {
@@ -76,6 +76,9 @@ func (c *Config) validate() error {
 	}
 	if c.Sync.Workers <= 0 {
 		c.Sync.Workers = 4
+	}
+	if c.Sync.Interval <= 0 {
+		return fmt.Errorf("sync.interval must be greater than zero")
 	}
 	if c.Sync.FolderStructure == "" {
 		c.Sync.FolderStructure = "none"

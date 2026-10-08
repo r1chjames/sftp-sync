@@ -62,14 +62,37 @@ type Syncer struct {
 	status SyncStatus
 	cancel context.CancelFunc
 	done   chan struct{}
+
+	// syncNow carries coalesced immediate-sync requests. A buffered channel of
+	// capacity one means any number of requests made while a cycle is running
+	// collapse into a single follow-up cycle.
+	syncNow chan struct{}
+
+	// syncFn runs one cycle. It is a field so tests can drive the loop without
+	// an SFTP server; production code always uses (*Syncer).sync.
+	syncFn func(context.Context) error
 }
 
 func New(cfg *config.Config) *Syncer {
-	return &Syncer{
-		cfg:    cfg,
-		client: sftpclient.New(cfg),
-		status: SyncStatus{Phase: PhaseIdle},
-		done:   make(chan struct{}),
+	s := &Syncer{
+		cfg:     cfg,
+		client:  sftpclient.New(cfg),
+		status:  SyncStatus{Phase: PhaseIdle},
+		done:    make(chan struct{}),
+		syncNow: make(chan struct{}, 1),
+	}
+	s.syncFn = s.sync
+	return s
+}
+
+// SyncNow requests an immediate sync cycle instead of waiting for the next
+// interval tick. It never blocks: a request made while a cycle is already
+// running is coalesced into a single follow-up cycle, so repeated calls cannot
+// run two cycles concurrently.
+func (s *Syncer) SyncNow() {
+	select {
+	case s.syncNow <- struct{}{}:
+	default:
 	}
 }
 
@@ -274,16 +297,41 @@ func (s *Syncer) recordCycle(ctx context.Context, err error) {
 func (s *Syncer) run(ctx context.Context) {
 	defer close(s.done)
 
-	// Run immediately on startup, then on each interval tick.
-	for {
-		s.recordCycle(ctx, s.sync(ctx))
+	// A reusable timer fires immediately so the first cycle runs at startup,
+	// then paces later cycles. Reusing one timer instead of calling time.After
+	// on every pass avoids leaving an abandoned timer behind on every tick.
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 
+	for {
 		select {
 		case <-ctx.Done():
 			s.client.Close()
 			return
-		case <-time.After(s.cfg.Sync.Interval):
+		case <-timer.C:
+		case <-s.syncNow:
 		}
+
+		// The timer is not needed while the cycle runs. Its pending value was
+		// either consumed above or is drained here.
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+
+		s.recordCycle(ctx, s.syncFn(ctx))
+
+		// A request that arrived while the cycle ran is served immediately;
+		// otherwise wait a full interval.
+		delay := s.cfg.Sync.Interval
+		select {
+		case <-s.syncNow:
+			delay = 0
+		default:
+		}
+		timer.Reset(delay)
 	}
 }
 
