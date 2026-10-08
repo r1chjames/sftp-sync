@@ -41,6 +41,17 @@ sync:
   # to the remote directory structure when EXIF data cannot be read.
   folder_structure: year_month
 
+  # What to do when the destination for a file is already taken, which happens
+  # when two remote files share a basename and a capture date.
+  # - "rename": write IMG_0001-2.JPG beside an existing IMG_0001.JPG (default)
+  # - "skip":   leave the existing file alone and report the file as skipped
+  # - "error":  fail the file
+  #
+  # The destination chosen for each file is recorded in the manifest, so a
+  # renamed file is updated in place on later syncs instead of being renamed
+  # again.
+  collision_policy: rename
+
 # Path for the state manifest (tracks what has been synced).
 # Defaults to ~/.local/share/sftpsync/manifest.json
 # state_path: ~/.local/share/sftpsync/manifest.json

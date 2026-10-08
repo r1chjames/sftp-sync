@@ -18,11 +18,23 @@ type SFTPConfig struct {
 	InsecureIgnoreHostKey bool   `yaml:"insecure_ignore_host_key"`
 }
 
+// Collision policies, applied when the destination for a downloaded file is
+// already occupied by something else.
+const (
+	// CollisionError fails the file.
+	CollisionError = "error"
+	// CollisionSkip leaves the existing file alone and records a skip.
+	CollisionSkip = "skip"
+	// CollisionRename writes IMG_0001-2.JPG beside an existing IMG_0001.JPG.
+	CollisionRename = "rename"
+)
+
 type SyncConfig struct {
 	Interval        time.Duration `yaml:"interval"`
 	Workers         int           `yaml:"workers"`
 	Extensions      []string      `yaml:"extensions"`
 	FolderStructure string        `yaml:"folder_structure"` // "none", "year", "year_month", or "year_month_day"
+	CollisionPolicy string        `yaml:"collision_policy"` // "error", "skip", or "rename"
 }
 
 type Config struct {
@@ -87,6 +99,18 @@ func (c *Config) validate() error {
 	case "none", "year", "year_month", "year_month_day":
 	default:
 		return fmt.Errorf("sync.folder_structure must be one of: none, year, year_month, year_month_day")
+	}
+	if c.Sync.CollisionPolicy == "" {
+		// Renaming is the only policy that cannot lose a photo: it neither
+		// overwrites an unrelated file nor leaves one unsynced, so it is the
+		// default for configs that predate the option.
+		c.Sync.CollisionPolicy = CollisionRename
+	}
+	switch c.Sync.CollisionPolicy {
+	case CollisionError, CollisionSkip, CollisionRename:
+	default:
+		return fmt.Errorf("sync.collision_policy must be one of: %s, %s, %s",
+			CollisionError, CollisionSkip, CollisionRename)
 	}
 	return nil
 }

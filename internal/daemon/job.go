@@ -50,6 +50,7 @@ type StatusResponse struct {
 	BatchTotal         int       `json:"batch_total"`
 	Completed          int       `json:"completed"`
 	Failed             int       `json:"failed"`
+	Skipped            int       `json:"skipped"`
 	Remaining          int       `json:"remaining"`
 	BytesTotal         int64     `json:"bytes_total"`
 	BytesCompleted     int64     `json:"bytes_completed"`
@@ -74,6 +75,7 @@ func (j *Job) toResponse() JobResponse {
 		BatchTotal:         st.BatchTotal,
 		Completed:          st.Completed,
 		Failed:             st.Failed,
+		Skipped:            st.Skipped,
 		Remaining:          st.Remaining,
 		BytesTotal:         st.BytesTotal,
 		BytesCompleted:     st.BytesCompleted,

@@ -142,9 +142,39 @@ sync:
     - .png
     - .heic
     - .raw
+
+  # How to organise photos locally, by EXIF capture date.
+  folder_structure: year_month   # none | year | year_month | year_month_day
+
+  # What to do when a destination is already taken.
+  collision_policy: rename       # rename | skip | error
 ```
 
 You can have as many config files as you like — one per SFTP source — and submit them all to the same running daemon.
+
+### Filename collisions
+
+With `folder_structure: year_month`, two remote photos that share a basename and a
+capture date want the same local path, for example
+`IMG_0001.JPG` from two different cameras on the same day. `collision_policy`
+decides what happens:
+
+| Policy | Behaviour |
+|---|---|
+| `rename` (default) | Writes `IMG_0001-2.JPG` beside the existing file, and tries `-3`, `-4`, … if those are taken too. |
+| `skip` | Leaves the existing file alone and reports the file as skipped, so it appears in `sftpsync status` and in the menu. |
+| `error` | Fails the file, so it shows up as a failure with the reason. |
+
+No policy overwrites an unrelated local file. The destination chosen for a file
+is recorded in the manifest, so a later change to that remote file updates the
+same local file instead of renaming it again. Syncs that predate this option
+behave as `rename`.
+
+With `collision_policy: skip` and `folder_structure: none`, the conflict is
+detected before the transfer, so a skipped file is not downloaded again on every
+poll. With EXIF folder organisation the destination is only known once the file's
+metadata has been read, so a skipped file is transferred and discarded again each
+poll until the conflict is resolved.
 
 ### Authentication
 
