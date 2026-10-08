@@ -22,7 +22,11 @@ type Job struct {
 	ID         string    `json:"id"`
 	ConfigPath string    `json:"config_path"`
 	AddedAt    time.Time `json:"added_at"`
-	syncer     jobSyncer
+	// LocalPath is the configured destination directory, read from the config
+	// when the job is added or restored. It is exposed read-only so clients can
+	// reveal the destination without parsing the config file themselves.
+	LocalPath string `json:"local_path,omitempty"`
+	syncer    jobSyncer
 }
 
 // JobResponse is the JSON-serialisable representation of a Job including live status.
@@ -30,6 +34,7 @@ type JobResponse struct {
 	ID         string         `json:"id"`
 	ConfigPath string         `json:"config_path"`
 	AddedAt    time.Time      `json:"added_at"`
+	LocalPath  string         `json:"local_path,omitempty"`
 	Status     StatusResponse `json:"status"`
 }
 
@@ -85,6 +90,7 @@ func (j *Job) toResponse() JobResponse {
 		ID:         j.ID,
 		ConfigPath: j.ConfigPath,
 		AddedAt:    j.AddedAt,
+		LocalPath:  j.LocalPath,
 		Status:     sr,
 	}
 }

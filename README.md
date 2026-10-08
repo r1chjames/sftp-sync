@@ -232,8 +232,9 @@ sftpsync/
 `sftpsyncbar` shows every job in the menu bar: phase, file progress (`18 of 64
 files`), byte percentage, the file currently downloading, the last successful
 sync, and the full text of the latest error in its own row. The menu-bar title
-shows the aggregate percentage of all downloading jobs, plus a warning marker
-when a job has failed.
+carries the overall state — `⟳ 42%` while transferring, `⏸` when paused, `⚠` when
+a job has failed, and nothing while idle — and hovering shows a summary such as
+`sftpsync — 3 jobs, 1 active, 1 paused, 1 with errors`.
 
 The menu polls once a second while any job is scanning or downloading, and every
 30 seconds when every job is idle or paused, so an open menu is never more than
@@ -241,11 +242,22 @@ two seconds out of date while work is happening and an inactive app stays quiet.
 `Refresh Status` fetches immediately; it does not start a sync.
 
 Each job has its own controls: `Pause` while it is active, `Resume` while it is
-paused, `Sync Now` to scan immediately, and `Remove Job…` last and clearly
-labelled because it is destructive. Controls are disabled while their request is
-in flight, and the menu refreshes as soon as it finishes. A failed action is
-shown in that job's own section rather than only being logged, alongside the
-daemon's latest sync error.
+paused, `Sync Now` to scan immediately, `Reveal Destination in Finder` to open
+the configured local directory, `Copy Error` to put the latest error on the
+clipboard, and `Remove Job…` last and clearly labelled because it is destructive.
+Controls are disabled while their request is in flight, and the menu refreshes as
+soon as it finishes. A failed action is shown in that job's own section rather
+than only being logged, alongside the daemon's latest sync error. Failures that
+belong to no single job, such as a config file that could not be added or a
+daemon that would not start, are shown at the top of the menu.
+
+`Open Daemon Log` opens `~/.local/share/sftpsync/sftpsyncd.log`, which is where
+the daemon's output goes when the menu-bar app starts it.
+
+The destination directory comes from the daemon's `local_path` field in the job
+list response, so the app never reads or parses the config file itself, and the
+path is passed to the system opener as a single argument rather than through a
+shell.
 
 The menu shows up to 10 jobs. If there are more, it says how many are not shown
 rather than hiding them silently.

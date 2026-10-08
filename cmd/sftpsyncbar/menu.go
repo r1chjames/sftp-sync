@@ -4,6 +4,8 @@ package main
 
 import (
 	"fmt"
+	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/getlantern/systray"
@@ -29,15 +31,35 @@ type jobSlot struct {
 	errorRow    *systray.MenuItem
 	actionRow   *systray.MenuItem
 
-	pauseBtn  *systray.MenuItem
-	resumeBtn *systray.MenuItem
-	syncBtn   *systray.MenuItem
-	removeBtn *systray.MenuItem
+	pauseBtn   *systray.MenuItem
+	resumeBtn  *systray.MenuItem
+	syncBtn    *systray.MenuItem
+	revealBtn  *systray.MenuItem
+	copyErrBtn *systray.MenuItem
+	removeBtn  *systray.MenuItem
 
 	mu          sync.Mutex
 	job         daemon.JobResponse
 	occupied    bool
 	actionError string
+}
+
+// slotRender is everything a slot pushes into systray in one pass.
+type slotRender struct {
+	view     menubar.SlotView
+	controls menubar.SlotControls
+	reveal   bool
+	copyErr  bool
+}
+
+// renderValues builds everything the slot displays. Callers must hold s.mu.
+func (s *jobSlot) renderValues() slotRender {
+	return slotRender{
+		view:     menubar.JobSlotView(s.job, s.actionError),
+		controls: menubar.SlotControlsFor(s.job.Status.Paused),
+		reveal:   menubar.RevealableDestination(s.job) != "",
+		copyErr:  menubar.CopyableError(s.job, s.actionError) != "",
+	}
 }
 
 // snapshot returns the job the slot currently displays, and whether the slot is
@@ -48,16 +70,23 @@ func (s *jobSlot) snapshot() (daemon.JobResponse, bool) {
 	return s.job, s.occupied
 }
 
+// copyableError returns the error text this slot can copy, or "" when there is
+// nothing to copy.
+func (s *jobSlot) copyableError() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return menubar.CopyableError(s.job, s.actionError)
+}
+
 // show renders a job into the slot, hiding rows that have nothing to say.
 func (s *jobSlot) show(j daemon.JobResponse) {
 	s.mu.Lock()
 	s.job = j
 	s.occupied = true
-	view := menubar.JobSlotView(s.job, s.actionError)
-	controls := menubar.SlotControlsFor(j.Status.Paused)
+	values := s.renderValues()
 	s.mu.Unlock()
 
-	s.render(view, controls)
+	s.render(values)
 }
 
 // clear empties the slot, used when the job list shrinks.
@@ -74,23 +103,29 @@ func (s *jobSlot) clear() {
 	s.lastSuccess.Hide()
 	s.errorRow.Hide()
 	s.actionRow.Hide()
-	s.pauseBtn.Hide()
-	s.resumeBtn.Hide()
-	s.syncBtn.Hide()
-	s.removeBtn.Hide()
+	for _, item := range s.controls() {
+		item.Hide()
+	}
 }
 
-func (s *jobSlot) render(view menubar.SlotView, controls menubar.SlotControls) {
-	s.header.SetTitle(view.Header)
-	s.state.SetTitle(view.State)
-	s.lastSuccess.SetTitle(view.LastSuccess)
-	setOptionalTitle(s.currentFile, view.CurrentFile)
-	setOptionalTitle(s.errorRow, view.Error)
-	setOptionalTitle(s.actionRow, view.ActionError)
+// controls returns every clickable control row in this slot.
+func (s *jobSlot) controls() []*systray.MenuItem {
+	return []*systray.MenuItem{s.pauseBtn, s.resumeBtn, s.syncBtn, s.revealBtn, s.copyErrBtn, s.removeBtn}
+}
 
-	setOptionalTitle(s.pauseBtn, visibleTitle(controls.ShowPause, "  Pause"))
-	setOptionalTitle(s.resumeBtn, visibleTitle(controls.ShowResume, "  Resume"))
+func (s *jobSlot) render(values slotRender) {
+	s.header.SetTitle(values.view.Header)
+	s.state.SetTitle(values.view.State)
+	s.lastSuccess.SetTitle(values.view.LastSuccess)
+	setOptionalTitle(s.currentFile, values.view.CurrentFile)
+	setOptionalTitle(s.errorRow, values.view.Error)
+	setOptionalTitle(s.actionRow, values.view.ActionError)
+
+	setOptionalTitle(s.pauseBtn, visibleTitle(values.controls.ShowPause, "  Pause"))
+	setOptionalTitle(s.resumeBtn, visibleTitle(values.controls.ShowResume, "  Resume"))
 	setOptionalTitle(s.syncBtn, "  Sync Now")
+	setOptionalTitle(s.revealBtn, visibleTitle(values.reveal, "  Reveal Destination in Finder"))
+	setOptionalTitle(s.copyErrBtn, visibleTitle(values.copyErr, "  Copy Error"))
 	setOptionalTitle(s.removeBtn, "  Remove Job…")
 
 	s.header.Show()
@@ -111,10 +146,10 @@ func visibleTitle(visible bool, title string) string {
 func (s *jobSlot) setActionError(message string) {
 	s.mu.Lock()
 	s.actionError = message
-	view := menubar.JobSlotView(s.job, s.actionError)
+	values := s.renderValues()
 	s.mu.Unlock()
 
-	setOptionalTitle(s.actionRow, view.ActionError)
+	s.render(values)
 }
 
 // clearActionError drops a previous failure, so it does not outlive the action
@@ -123,10 +158,10 @@ func (s *jobSlot) clearActionError() {
 	s.setActionError("")
 }
 
-// setControlsEnabled disables a slot's controls while its request is in flight,
-// so a double click cannot start a second request.
+// setControlsEnabled disables a slot's clickable rows while a request is in
+// flight, so a double click cannot start a second request.
 func (s *jobSlot) setControlsEnabled(enabled bool) {
-	for _, item := range []*systray.MenuItem{s.pauseBtn, s.resumeBtn, s.syncBtn, s.removeBtn} {
+	for _, item := range s.controls() {
 		if enabled {
 			item.Enable()
 			continue
@@ -148,12 +183,14 @@ func setOptionalTitle(item *systray.MenuItem, title string) {
 
 type appMenu struct {
 	daemonStatus    *systray.MenuItem
+	notice          *systray.MenuItem
 	noJobs          *systray.MenuItem
 	slots           [maxSlots]jobSlot
 	moreJobs        *systray.MenuItem
 	addItem         *systray.MenuItem
 	stopAllItem     *systray.MenuItem
 	startDaemonItem *systray.MenuItem
+	openLogItem     *systray.MenuItem
 	refreshItem     *systray.MenuItem
 	quitItem        *systray.MenuItem
 }
@@ -163,6 +200,9 @@ func buildMenu() *appMenu {
 
 	m.daemonStatus = systray.AddMenuItem("Daemon: starting…", "")
 	m.daemonStatus.Disable()
+	m.notice = systray.AddMenuItem("", "")
+	m.notice.Disable()
+	m.notice.Hide()
 	systray.AddSeparator()
 
 	for i := range m.slots {
@@ -183,6 +223,8 @@ func buildMenu() *appMenu {
 		s.pauseBtn = systray.AddMenuItem("  Pause", "Stop starting new scans and downloads for this job")
 		s.resumeBtn = systray.AddMenuItem("  Resume", "Clear the paused state and scan this job now")
 		s.syncBtn = systray.AddMenuItem("  Sync Now", "Scan and download new files for this job now")
+		s.revealBtn = systray.AddMenuItem("  Reveal Destination in Finder", "Open this job's local destination directory")
+		s.copyErrBtn = systray.AddMenuItem("  Copy Error", "Copy this job's error to the clipboard")
 		// Remove is destructive and comes last, after the non-destructive
 		// controls, so it is not clicked by accident.
 		s.removeBtn = systray.AddMenuItem("  Remove Job…", "Stop and remove this job. This cannot be undone.")
@@ -200,6 +242,7 @@ func buildMenu() *appMenu {
 	m.stopAllItem = systray.AddMenuItem("Stop All Syncs", "Stop the sync daemon and all running jobs")
 	m.startDaemonItem = systray.AddMenuItem("Start Daemon", "Start the sync daemon")
 	m.startDaemonItem.Hide()
+	m.openLogItem = systray.AddMenuItem("Open Daemon Log", "Open the sync daemon's log file")
 	m.refreshItem = systray.AddMenuItem("Refresh Status", "Fetch the latest job status now")
 	systray.AddSeparator()
 	m.quitItem = systray.AddMenuItem("Quit", "Quit sftpsync menu bar app")
@@ -207,12 +250,32 @@ func buildMenu() *appMenu {
 	return m
 }
 
+// setNotice reports a menu-level failure, such as a job that could not be added
+// or a daemon that would not start. It stays until the next attempt, because a
+// refresh must not wipe it before it can be read.
+func (m *appMenu) setNotice(message string) {
+	if message == "" {
+		m.clearNotice()
+		return
+	}
+	m.notice.SetTitle("  ⚠ " + message)
+	m.notice.Show()
+}
+
+func (m *appMenu) clearNotice() {
+	m.notice.SetTitle("")
+	m.notice.Hide()
+}
+
 // update refreshes the menu to reflect the current job list.
 // Safe to call from any goroutine.
 func (m *appMenu) update(jobs []daemon.JobResponse, err error) {
-	// The title shows an aggregate percentage while jobs are downloading, and
-	// an empty title restores the icon-only menu bar.
-	systray.SetTitle(menubar.MenuTitle(jobs))
+	// The title carries the overall state: an aggregate percentage while jobs
+	// are downloading, and a marker for active, paused, or failed jobs. An empty
+	// title restores the icon-only menu bar.
+	status := menubar.MenuStatusFor(jobs)
+	systray.SetTitle(status.Title)
+	systray.SetTooltip(status.Tooltip)
 
 	if err != nil {
 		m.daemonStatus.SetTitle("Daemon: Not Running ●")
@@ -294,12 +357,16 @@ func slotAction(ch <-chan struct{}, slot *jobSlot, act func(daemon.JobResponse) 
 // longer scales: ten job slots with four controls each would need forty cases.
 func (m *appMenu) menuEvents(r *refresher, client *apiclient.Client, mgr *DaemonManager) []menuEvent {
 	events := []menuEvent{
-		immediate(m.addItem.ClickedCh, func() { handleAdd(client, r) }),
+		immediate(m.addItem.ClickedCh, func() { m.add(client, r) }),
 		immediate(m.stopAllItem.ClickedCh, func() { handleStopAll(client, r) }),
 		immediate(m.refreshItem.ClickedCh, r.now),
 		immediate(m.quitItem.ClickedCh, systray.Quit),
+		immediate(m.openLogItem.ClickedCh, m.openLog),
 		immediate(m.startDaemonItem.ClickedCh, func() {
-			mgr.EnsureRunning()
+			m.clearNotice()
+			if err := mgr.EnsureRunning(); err != nil {
+				m.setNotice(menubar.ActionFailure("start daemon", err))
+			}
 			r.now()
 		}),
 	}
@@ -315,6 +382,12 @@ func (m *appMenu) menuEvents(r *refresher, client *apiclient.Client, mgr *Daemon
 			}),
 			slotAction(slot.syncBtn.ClickedCh, slot, func(job daemon.JobResponse) func() {
 				return func() { m.control(slot, job, "sync", client, r) }
+			}),
+			slotAction(slot.revealBtn.ClickedCh, slot, func(job daemon.JobResponse) func() {
+				return func() { m.revealDestination(slot, job) }
+			}),
+			slotAction(slot.copyErrBtn.ClickedCh, slot, func(job daemon.JobResponse) func() {
+				return func() { m.copyError(slot) }
 			}),
 			slotAction(slot.removeBtn.ClickedCh, slot, func(job daemon.JobResponse) func() {
 				return func() { m.remove(slot, job, client, r) }
@@ -389,16 +462,77 @@ func (m *appMenu) remove(slot *jobSlot, job daemon.JobResponse, client *apiclien
 	r.now()
 }
 
-func handleAdd(client *apiclient.Client, r *refresher) {
+// add starts a new job from a config file the user picks, and reports a failure
+// in the menu instead of only logging it.
+func (m *appMenu) add(client *apiclient.Client, r *refresher) {
 	path, err := pickConfigFile()
 	if err != nil {
 		return // user cancelled
 	}
+
+	m.clearNotice()
 	if _, err := client.AddJob(path); err != nil {
-		// TODO: show error in menu
-		return
+		m.setNotice(menubar.ActionFailure("add job", err))
 	}
 	r.now()
+}
+
+// openLog opens the daemon's log file with the system opener.
+func (m *appMenu) openLog() {
+	m.clearNotice()
+	if err := openPath(daemonLogPath()); err != nil {
+		m.setNotice(fmt.Sprintf("open daemon log failed: %v", err))
+	}
+}
+
+// revealDestination opens a job's destination directory.
+//
+// The path comes from the daemon's read-only response field, so the app never
+// parses the config file itself, and it is passed to the opener as a single
+// argument rather than through a shell.
+func (m *appMenu) revealDestination(slot *jobSlot, job daemon.JobResponse) {
+	destination := menubar.RevealableDestination(job)
+	if destination == "" {
+		slot.setActionError("reveal destination failed: the daemon reported no local path")
+		return
+	}
+
+	slot.setControlsEnabled(false)
+	slot.clearActionError()
+	if err := openPath(destination); err != nil {
+		slot.setActionError(fmt.Sprintf("reveal destination failed: %v", err))
+	}
+	slot.setControlsEnabled(true)
+}
+
+// copyError puts a job's error text on the clipboard.
+func (m *appMenu) copyError(slot *jobSlot) {
+	text := slot.copyableError()
+	if text == "" {
+		return
+	}
+
+	if err := copyToClipboard(text); err != nil {
+		slot.setActionError(fmt.Sprintf("copy error failed: %v", err))
+	}
+}
+
+// openPath reveals a path with the system opener.
+//
+// The path is passed as an argv entry, so no shell is involved and a path
+// containing spaces or shell metacharacters cannot be interpreted as a command.
+func openPath(path string) error {
+	name, args := menubar.RevealCommand(path)
+	return exec.Command(name, args...).Run()
+}
+
+// copyToClipboard writes text to the clipboard program's standard input, never
+// as an argument and never through a shell.
+func copyToClipboard(text string) error {
+	name, args := menubar.CopyCommand()
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
 }
 
 func handleStopAll(client *apiclient.Client, r *refresher) {
