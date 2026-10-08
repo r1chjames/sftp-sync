@@ -29,6 +29,16 @@ const (
 	CollisionRename = "rename"
 )
 
+// Verification modes, deciding how far the daemon goes to be sure that a local
+// file and the remote file it represents are the same file.
+const (
+	// VerifySize trusts the manifest's modification time and size.
+	VerifySize = "size"
+	// VerifySHA256 compares content hashes, at the cost of reading the remote
+	// file again.
+	VerifySHA256 = "sha256"
+)
+
 type SyncConfig struct {
 	Interval        time.Duration `yaml:"interval"`
 	Workers         int           `yaml:"workers"`
@@ -36,6 +46,7 @@ type SyncConfig struct {
 	FolderStructure string        `yaml:"folder_structure"` // "none", "year", "year_month", or "year_month_day"
 	CollisionPolicy string        `yaml:"collision_policy"` // "error", "skip", or "rename"
 	MaxAttempts     int           `yaml:"max_attempts"`     // per-file transfer attempts, including the first
+	Verify          string        `yaml:"verify"`           // "size" or "sha256"
 }
 
 type Config struct {
@@ -120,6 +131,16 @@ func (c *Config) validate() error {
 	}
 	if c.Sync.MaxAttempts < 1 || c.Sync.MaxAttempts > 10 {
 		return fmt.Errorf("sync.max_attempts must be between 1 and 10")
+	}
+	if c.Sync.Verify == "" {
+		// Trusting the manifest's modification time and size costs nothing extra
+		// and is what every sync before this option did.
+		c.Sync.Verify = VerifySize
+	}
+	switch c.Sync.Verify {
+	case VerifySize, VerifySHA256:
+	default:
+		return fmt.Errorf("sync.verify must be one of: %s, %s", VerifySize, VerifySHA256)
 	}
 	return nil
 }

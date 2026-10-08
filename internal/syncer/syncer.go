@@ -85,6 +85,10 @@ type Syncer struct {
 	// can make backoff deterministic.
 	jitter func() float64
 
+	// hashRemote computes a remote file's content digest. It is a field so tests
+	// can script digests without a server, in the same way syncFn is.
+	hashRemote func(ctx context.Context, remotePath string) (string, error)
+
 	// syncFn runs one cycle. It is a field so tests can drive the loop without
 	// an SFTP server; production code always uses (*Syncer).sync.
 	syncFn func(context.Context) error
@@ -101,6 +105,7 @@ func New(cfg *config.Config) *Syncer {
 		pauseCh: make(chan struct{}, 1),
 	}
 	s.syncFn = s.sync
+	s.hashRemote = s.client.HashRemote
 	return s
 }
 
@@ -483,7 +488,7 @@ func (s *Syncer) sync(ctx context.Context) error {
 		return fmt.Errorf("walk %s: %w", s.cfg.SFTP.RemotePath, err)
 	}
 
-	eligible, toDownload := s.selectForDownload(remoteFiles)
+	eligible, toDownload := s.selectForDownload(ctx, remoteFiles)
 	s.setEligibleFiles(eligible)
 
 	if err := s.manifest.Save(); err != nil {
@@ -510,30 +515,44 @@ func (s *Syncer) sync(ctx context.Context) error {
 	return nil
 }
 
-func (s *Syncer) selectForDownload(remoteFiles []sftpclient.RemoteFile) (int, []sftpclient.RemoteFile) {
+func (s *Syncer) selectForDownload(ctx context.Context, remoteFiles []sftpclient.RemoteFile) (int, []sftpclient.RemoteFile) {
 	var toDownload []sftpclient.RemoteFile
 	eligible := 0
 	for _, f := range remoteFiles {
+		if ctx.Err() != nil {
+			// Stopping is the caller's business, but there is no point
+			// inspecting further files, and in hash mode each inspection can
+			// read a remote file.
+			break
+		}
+
 		if !s.matchesFilter(f.Path) {
 			continue
 		}
 		eligible++
 		entry, ok := s.manifest.Get(f.Path)
-		if !ok || !entry.MTime.Equal(f.MTime) || entry.Size != f.Size {
-			// For files not yet in the manifest, adopt them if they already
-			// exist locally rather than re-downloading.
-			if !ok {
-				// The destination without EXIF organisation is knowable here, so
-				// adopt rather than re-downloading a file that is already local.
-				adopted := s.localPath(f.Path)
-				if _, err := os.Stat(adopted); err == nil {
-					log.Printf("adopting existing local file: %s", f.Path)
-					s.manifest.Set(f.Path, state.Entry{MTime: f.MTime, Size: f.Size, LocalPath: adopted})
-					continue
-				}
-			}
-			toDownload = append(toDownload, f)
+		if ok && entry.MTime.Equal(f.MTime) && entry.Size == f.Size {
+			continue
 		}
+
+		if !ok {
+			// A file the manifest has never seen may still be on disk from a
+			// previous run, an interrupted manifest write, or a user copying it
+			// there. Adopt it only when it can be shown to be the same file, so
+			// an empty or truncated local file is not recorded as a synced photo.
+			adoptPath := s.localPath(f.Path)
+			adopted, digest, err := s.adoptable(ctx, f, adoptPath)
+			switch {
+			case err != nil:
+				log.Printf("could not check existing local file %s: %v", adoptPath, err)
+			case adopted:
+				log.Printf("adopting existing local file: %s", f.Path)
+				s.manifest.Set(f.Path, entryFor(f, adoptPath, digest))
+				continue
+			}
+		}
+
+		toDownload = append(toDownload, f)
 	}
 	return eligible, toDownload
 }
@@ -586,8 +605,26 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			// Stage the download to a temp file so we can inspect it. Transient
 			// failures are retried with backoff; each attempt restarts the file
 			// from the beginning, so a partial attempt is not progress.
+			var digest string
 			tmpPath, err := s.downloadWithRetries(ctx, f.Path, fp, func() (string, error) {
-				return s.client.DownloadTempProgress(f.Path, s.cfg.LocalPath, fp.update)
+				tmp, err := s.client.DownloadTempProgress(f.Path, s.cfg.LocalPath, fp.update)
+				if err != nil {
+					return "", err
+				}
+				if s.cfg.Sync.Verify != config.VerifySHA256 {
+					return tmp, nil
+				}
+
+				// Verify while the bytes are still in the staging file, so a
+				// corrupted transfer never reaches the destination and the retry
+				// has nothing to clean up there.
+				verified, err := s.verifyDownload(ctx, f.Path, tmp)
+				if err != nil {
+					os.Remove(tmp)
+					return "", err
+				}
+				digest = verified
+				return tmp, nil
 			})
 			if err != nil {
 				s.recordFileResult(f.Path, err, fp.copied)
@@ -640,7 +677,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			}
 
 			s.recordFileResult(f.Path, nil, fp.copied)
-			results <- downloadOutcome{file: f, localPath: finalPath}
+			results <- downloadOutcome{file: f, localPath: finalPath, digest: digest}
 		}(f)
 	}
 
@@ -685,13 +722,7 @@ func (s *Syncer) applyDownloadOutcomes(outcomes []downloadOutcome, attempted, to
 
 		result.Completed++
 		log.Printf("synced: %s", r.file.Path)
-		s.manifest.Set(r.file.Path, state.Entry{
-			MTime: r.file.MTime,
-			Size:  r.file.Size,
-			// Record the destination that was actually used, so the next sync
-			// updates this file instead of choosing another name.
-			LocalPath: r.localPath,
-		})
+		s.manifest.Set(r.file.Path, entryFor(r.file, r.localPath, r.digest))
 	}
 
 	return result
@@ -722,8 +753,10 @@ type fileFailure struct {
 type downloadOutcome struct {
 	file      sftpclient.RemoteFile
 	localPath string
-	skipped   bool
-	err       error
+	// digest is the verified content hash, empty unless sha256 mode ran.
+	digest  string
+	skipped bool
+	err     error
 }
 
 // failureError summarises a failed batch for the job status.

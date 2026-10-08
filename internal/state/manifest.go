@@ -19,6 +19,10 @@ type Entry struct {
 	// It is absent in manifests written before collision handling existed, and
 	// for files adopted from disk under their original name.
 	LocalPath string `json:"local_path,omitempty"`
+	// SHA256 is the verified content digest of the local file, recorded only in
+	// sha256 verification mode. Its absence is the normal case and means the
+	// file's contents were never hashed.
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // Manifest persists the set of remote files that have been synced locally.

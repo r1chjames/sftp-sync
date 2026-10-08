@@ -52,6 +52,12 @@ func transient(err error) bool {
 		return false
 	}
 
+	// A transfer whose bytes did not survive it is worth another attempt: that
+	// is exactly what the retry may fix.
+	if errors.Is(err, errChecksumMismatch) {
+		return true
+	}
+
 	// Short reads and truncated transfers are the classic flaky-network case
 	// and are always worth another attempt.
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) {

@@ -192,3 +192,43 @@ func TestMaxAttemptsDefaultAndValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifyDefaultAndValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{name: "unset defaults to size", value: "", want: VerifySize},
+		{name: "size", value: "size", want: VerifySize},
+		{name: "sha256", value: "sha256", want: VerifySHA256},
+		{name: "unknown is rejected", value: "md5", wantErr: true},
+		{name: "case matters", value: "SHA256", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Sync.Verify = tt.value
+
+			err := cfg.validate()
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("validate() = nil, want an error for %q", tt.value)
+				}
+				if !strings.Contains(err.Error(), "sync.verify") {
+					t.Fatalf("error = %v, want sync.verify", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validate() error = %v", err)
+			}
+			if cfg.Sync.Verify != tt.want {
+				t.Fatalf("verify = %q, want %q", cfg.Sync.Verify, tt.want)
+			}
+		})
+	}
+}

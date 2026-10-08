@@ -58,6 +58,17 @@ sync:
   # retried. A file that fails is retried again on the next poll.
   max_attempts: 3
 
+  # How much work to do to be sure a local file really is the file the server is
+  # offering.
+  # - "size":   trust the manifest's modification time and size (default)
+  # - "sha256": compare content hashes
+  #
+  # Either way, a local file is only adopted as an already-synced copy when its
+  # size matches the remote file, so an empty or truncated file is not mistaken
+  # for a finished download. sha256 mode additionally reads the remote file back,
+  # which costs a second transfer per verified file.
+  verify: size
+
 # Path for the state manifest (tracks what has been synced).
 # Defaults to ~/.local/share/sftpsync/manifest.json
 # state_path: ~/.local/share/sftpsync/manifest.json
