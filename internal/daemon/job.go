@@ -6,9 +6,14 @@ import (
 	"github.com/r1chjames/sftp-sync/internal/syncer"
 )
 
+// jobSyncer is the part of a syncer a managed job needs. It is an interface so
+// the daemon, its HTTP handlers, and its tests can run without SFTP.
 type jobSyncer interface {
 	Status() syncer.SyncStatus
 	Stop()
+	SyncNow()
+	Pause()
+	Resume()
 }
 
 // Job represents a managed sync job.

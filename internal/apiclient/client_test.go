@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/r1chjames/sftp-sync/internal/daemon"
 )
 
 // newTestClient points a client at an httptest server instead of the real Unix
@@ -164,6 +166,83 @@ func TestResponseErrorFallsBackToStatusText(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "Forbidden") {
 		t.Fatalf("error = %v, want status code and status text", err)
+	}
+}
+
+func TestJobControlMethods(t *testing.T) {
+	tests := []struct {
+		name   string
+		method func(*Client) (daemon.JobResponse, error)
+		path   string
+	}{
+		{"sync", func(c *Client) (daemon.JobResponse, error) { return c.SyncJob("abc12345") }, "/jobs/abc12345/sync"},
+		{"pause", func(c *Client) (daemon.JobResponse, error) { return c.PauseJob("abc12345") }, "/jobs/abc12345/pause"},
+		{"resume", func(c *Client) (daemon.JobResponse, error) { return c.ResumeJob("abc12345") }, "/jobs/abc12345/resume"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPath, gotMethod string
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				gotPath, gotMethod = r.URL.Path, r.Method
+				w.WriteHeader(http.StatusAccepted)
+				w.Write([]byte(`{"id":"abc12345","status":{"phase":"paused"}}`))
+			})
+
+			job, err := tt.method(c)
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if gotPath != tt.path || gotMethod != http.MethodPost {
+				t.Fatalf("request = %s %s, want POST %s", gotMethod, gotPath, tt.path)
+			}
+			if job.ID != "abc12345" || job.Status.Phase != "paused" {
+				t.Fatalf("job = %+v", job)
+			}
+		})
+	}
+}
+
+func TestJobControlNotFound(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "job abc12345 not found", http.StatusNotFound)
+	})
+
+	for _, call := range []func() (daemon.JobResponse, error){
+		func() (daemon.JobResponse, error) { return c.SyncJob("abc12345") },
+		func() (daemon.JobResponse, error) { return c.PauseJob("abc12345") },
+		func() (daemon.JobResponse, error) { return c.ResumeJob("abc12345") },
+	} {
+		if _, err := call(); err == nil {
+			t.Fatal("call returned nil error for a 404 response")
+		} else if !strings.Contains(err.Error(), "not found") || !strings.Contains(err.Error(), "abc12345") {
+			t.Fatalf("error = %v, want job ID and not found", err)
+		}
+	}
+}
+
+func TestJobControlDaemonError(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "job is shutting down", http.StatusConflict)
+	})
+
+	_, err := c.PauseJob("abc12345")
+	if err == nil {
+		t.Fatal("PauseJob returned nil error for a 409 response")
+	}
+	if !strings.Contains(err.Error(), "409") || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("error = %v, want status code and daemon message", err)
+	}
+}
+
+func TestJobControlRejectsUnexpectedSuccessCode(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"abc12345"}`))
+	})
+
+	if _, err := c.SyncJob("abc12345"); err == nil {
+		t.Fatal("SyncJob accepted a 200 response where 202 is required")
 	}
 }
 
