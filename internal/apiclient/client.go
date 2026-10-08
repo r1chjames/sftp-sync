@@ -7,21 +7,26 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/r1chjames/sftp-sync/internal/daemon"
 )
 
-const baseURL = "http://daemon"
+// defaultBaseURL is the authority for requests; the transport dials the Unix
+// socket regardless of the host in the URL.
+const defaultBaseURL = "http://daemon"
 
 // Client communicates with the sftpsyncd daemon over its Unix socket.
 type Client struct {
-	http *http.Client
+	http    *http.Client
+	baseURL string
 }
 
 func New() *Client {
 	socketPath := daemon.SocketPath()
 	return &Client{
+		baseURL: defaultBaseURL,
 		http: &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
@@ -33,22 +38,40 @@ func New() *Client {
 	}
 }
 
-// Ping returns nil if the daemon is reachable.
+// responseError converts a non-success response into an error that preserves
+// the status code and the daemon's message.
+func responseError(resp *http.Response) error {
+	var b bytes.Buffer
+	b.ReadFrom(resp.Body)
+	msg := strings.TrimSpace(b.String())
+	if msg == "" {
+		msg = http.StatusText(resp.StatusCode)
+	}
+	return fmt.Errorf("daemon error (%d): %s", resp.StatusCode, msg)
+}
+
+// Ping returns nil if the daemon is reachable and serving the API.
 func (c *Client) Ping() error {
-	resp, err := c.http.Get(baseURL + "/jobs")
+	resp, err := c.http.Get(c.baseURL + "/jobs")
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return responseError(resp)
+	}
 	return nil
 }
 
 func (c *Client) ListJobs() ([]daemon.JobResponse, error) {
-	resp, err := c.http.Get(baseURL + "/jobs")
+	resp, err := c.http.Get(c.baseURL + "/jobs")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, responseError(resp)
+	}
 	var jobs []daemon.JobResponse
 	if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
@@ -58,15 +81,13 @@ func (c *Client) ListJobs() ([]daemon.JobResponse, error) {
 
 func (c *Client) AddJob(configPath string) (daemon.JobResponse, error) {
 	body, _ := json.Marshal(map[string]string{"config_path": configPath})
-	resp, err := c.http.Post(baseURL+"/jobs", "application/json", bytes.NewReader(body))
+	resp, err := c.http.Post(c.baseURL+"/jobs", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return daemon.JobResponse{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		var b bytes.Buffer
-		b.ReadFrom(resp.Body)
-		return daemon.JobResponse{}, fmt.Errorf("daemon error (%d): %s", resp.StatusCode, b.String())
+		return daemon.JobResponse{}, responseError(resp)
 	}
 	var job daemon.JobResponse
 	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
@@ -76,23 +97,32 @@ func (c *Client) AddJob(configPath string) (daemon.JobResponse, error) {
 }
 
 func (c *Client) RemoveJob(id string) error {
-	req, _ := http.NewRequest(http.MethodDelete, baseURL+"/jobs/"+id, nil)
+	req, err := http.NewRequest(http.MethodDelete, c.baseURL+"/jobs/"+id, nil)
+	if err != nil {
+		return err
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return fmt.Errorf("job %s not found", id)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		return responseError(resp)
 	}
 	return nil
 }
 
 func (c *Client) Shutdown() error {
-	resp, err := c.http.Post(baseURL+"/shutdown", "", nil)
+	resp, err := c.http.Post(c.baseURL+"/shutdown", "", nil)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return responseError(resp)
+	}
 	return nil
 }
