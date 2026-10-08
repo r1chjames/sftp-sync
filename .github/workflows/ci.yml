@@ -24,3 +24,23 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+  menu-bar:
+    # sftpsyncbar is macOS-only and needs cgo for the getlantern/systray
+    # bindings, so the ubuntu job above cannot compile it. Without this job the
+    # menu-bar app would only ever be built when a release is tagged.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build sftpsyncbar
+        env:
+          CGO_ENABLED: 1
+        run: go build ./cmd/sftpsyncbar
+
+      - name: Test menubar logic
+        run: go test ./internal/menubar/
