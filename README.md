@@ -5,7 +5,11 @@ A lightweight Go daemon that manages multiple SFTP sync jobs, each with its own 
 ## Features
 
 - Multiple independent sync jobs, each targeting a different SFTP server or path
-- Jobs persist across daemon restarts
+- Jobs persist across daemon restarts, including paused state
+- Pause and resume a job at any time without losing progress
+- Sync on demand with `sftpsync sync <id>` instead of waiting for the interval
+- Live per-job status: phase, file and byte progress, current file, last success, last error
+- macOS menu-bar app with adaptive polling and an aggregate progress percentage
 - Polls on a configurable interval per job (no SFTP push support required)
 - Tracks remote file state via a local JSON manifest (mtime + size)
 - Concurrent downloads with a bounded goroutine pool
@@ -204,18 +208,38 @@ systemctl --user enable --now sftpsyncd
 sftpsync/
 ├── cmd/
 │   ├── sftpsyncd/main.go         # daemon binary
-│   └── sftpsync/main.go          # CLI client binary
+│   ├── sftpsync/main.go          # CLI client binary
+│   └── sftpsyncbar/              # macOS menu-bar app
+│       ├── status.go             # pure status/refresh logic (cross-platform)
+│       ├── menu.go               # systray menu construction
+│       └── refresh.go            # adaptive polling
 ├── internal/
+│   ├── apiclient/client.go       # HTTP-over-Unix-socket client
 │   ├── config/config.go          # YAML config loading and validation
 │   ├── daemon/
 │   │   ├── daemon.go             # job registry, lifecycle management
 │   │   ├── api.go                # HTTP API over Unix socket
 │   │   └── job.go                # Job type and JSON response types
+│   ├── humanize/humanize.go      # byte, percentage, and phase formatting
 │   ├── sftp/client.go            # SSH/SFTP connection, walk, download
 │   ├── state/manifest.go         # per-job sync state (JSON)
 │   └── syncer/syncer.go          # poll loop, diff logic, worker pool
 └── config.yaml.example
 ```
+
+## Menu bar app (macOS)
+
+`sftpsyncbar` shows every job in the menu bar: phase, file progress (`18 of 64
+files`), byte percentage, the file currently downloading, the last successful
+sync, and the full text of the latest error in its own row. The menu-bar title
+shows the aggregate percentage of all downloading jobs, plus a warning marker
+when a job has failed.
+
+The menu polls once a second while any job is scanning or downloading, and every
+30 seconds when every job is idle or paused, so an open menu is never more than
+two seconds out of date while work is happening and an inactive app stays quiet.
+`Refresh Status` fetches immediately; it does not start a sync. Use
+`sftpsync sync <id>` for that.
 
 ## Roadmap
 

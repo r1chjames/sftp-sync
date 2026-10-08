@@ -3,25 +3,62 @@
 package main
 
 import (
-	"fmt"
-	"log"
-	"path/filepath"
-	"strings"
-	"time"
-
 	"github.com/getlantern/systray"
 	"github.com/r1chjames/sftp-sync/internal/apiclient"
 	"github.com/r1chjames/sftp-sync/internal/daemon"
+	"github.com/r1chjames/sftp-sync/internal/menubar"
 )
 
 const maxSlots = 10
 
+// jobSlot is one job's group of menu rows. The row text is produced by the pure
+// helpers in status.go; this type only pushes it into systray.
 type jobSlot struct {
-	header    *systray.MenuItem
-	lastSync  *systray.MenuItem
-	fileCount *systray.MenuItem
-	removeBtn *systray.MenuItem
-	jobID     string
+	header      *systray.MenuItem
+	state       *systray.MenuItem
+	currentFile *systray.MenuItem
+	lastSuccess *systray.MenuItem
+	errorRow    *systray.MenuItem
+	removeBtn   *systray.MenuItem
+	jobID       string
+}
+
+func (s *jobSlot) hide() {
+	s.header.Hide()
+	s.state.Hide()
+	s.currentFile.Hide()
+	s.lastSuccess.Hide()
+	s.errorRow.Hide()
+	s.removeBtn.Hide()
+}
+
+// show renders a job into the slot, hiding rows that have nothing to say.
+func (s *jobSlot) show(j daemon.JobResponse) {
+	s.jobID = j.ID
+	view := menubar.JobSlotView(j)
+
+	s.header.SetTitle(view.Header)
+	s.state.SetTitle(view.State)
+	s.lastSuccess.SetTitle(view.LastSuccess)
+
+	setOptionalTitle(s.currentFile, view.CurrentFile)
+	setOptionalTitle(s.errorRow, view.Error)
+
+	s.header.Show()
+	s.state.Show()
+	s.lastSuccess.Show()
+	s.removeBtn.Show()
+}
+
+// setOptionalTitle shows a row only when it has content, so empty rows never
+// take up space in the menu.
+func setOptionalTitle(item *systray.MenuItem, title string) {
+	if title == "" {
+		item.Hide()
+		return
+	}
+	item.SetTitle(title)
+	item.Show()
 }
 
 type appMenu struct {
@@ -46,16 +83,16 @@ func buildMenu() *appMenu {
 		s := &m.slots[i]
 		s.header = systray.AddMenuItem("", "")
 		s.header.Disable()
-		s.lastSync = systray.AddMenuItem("", "")
-		s.lastSync.Disable()
-		s.fileCount = systray.AddMenuItem("", "")
-		s.fileCount.Disable()
+		s.state = systray.AddMenuItem("", "")
+		s.state.Disable()
+		s.currentFile = systray.AddMenuItem("", "")
+		s.currentFile.Disable()
+		s.lastSuccess = systray.AddMenuItem("", "")
+		s.lastSuccess.Disable()
+		s.errorRow = systray.AddMenuItem("", "")
+		s.errorRow.Disable()
 		s.removeBtn = systray.AddMenuItem("  Remove job", "Stop and remove this sync job")
-		// Hide all slots initially.
-		s.header.Hide()
-		s.lastSync.Hide()
-		s.fileCount.Hide()
-		s.removeBtn.Hide()
+		s.hide()
 	}
 
 	m.noJobs = systray.AddMenuItem("No jobs — use 'Add Job' to get started", "")
@@ -66,7 +103,7 @@ func buildMenu() *appMenu {
 	m.stopAllItem = systray.AddMenuItem("Stop All Syncs", "Stop the sync daemon and all running jobs")
 	m.startDaemonItem = systray.AddMenuItem("Start Daemon", "Start the sync daemon")
 	m.startDaemonItem.Hide()
-	m.refreshItem = systray.AddMenuItem("Refresh Now", "Fetch latest job status")
+	m.refreshItem = systray.AddMenuItem("Refresh Status", "Fetch the latest job status now")
 	systray.AddSeparator()
 	m.quitItem = systray.AddMenuItem("Quit", "Quit sftpsync menu bar app")
 
@@ -76,6 +113,10 @@ func buildMenu() *appMenu {
 // update refreshes the menu to reflect the current job list.
 // Safe to call from any goroutine.
 func (m *appMenu) update(jobs []daemon.JobResponse, err error) {
+	// The title shows an aggregate percentage while jobs are downloading, and
+	// an empty title restores the icon-only menu bar.
+	systray.SetTitle(menubar.MenuTitle(jobs))
+
 	if err != nil {
 		m.daemonStatus.SetTitle("Daemon: Not Running ●")
 		m.addItem.Disable()
@@ -89,38 +130,14 @@ func (m *appMenu) update(jobs []daemon.JobResponse, err error) {
 	m.stopAllItem.Show()
 	m.startDaemonItem.Hide()
 
-	// Populate visible slots.
 	for i := range m.slots {
 		s := &m.slots[i]
 		if i >= len(jobs) {
 			s.jobID = ""
-			s.header.Hide()
-			s.lastSync.Hide()
-			s.fileCount.Hide()
-			s.removeBtn.Hide()
+			s.hide()
 			continue
 		}
-		j := jobs[i]
-		s.jobID = j.ID
-
-		name := jobDisplayName(j.ConfigPath)
-		prefix := "●"
-		if j.Status.LastError != "" {
-			prefix = "⚠"
-		}
-		s.header.SetTitle(fmt.Sprintf("%s %s", prefix, name))
-
-		lastSync := "Last sync: never"
-		if !j.Status.LastSync.IsZero() {
-			lastSync = "Last sync: " + j.Status.LastSync.Format("2006-01-02 15:04")
-		}
-		s.lastSync.SetTitle("  " + lastSync)
-		s.fileCount.SetTitle(fmt.Sprintf("  Files: %d", j.Status.FilesTotal))
-
-		s.header.Show()
-		s.lastSync.Show()
-		s.fileCount.Show()
-		s.removeBtn.Show()
+		s.show(jobs[i])
 	}
 
 	if len(jobs) == 0 {
@@ -132,10 +149,8 @@ func (m *appMenu) update(jobs []daemon.JobResponse, err error) {
 
 func (m *appMenu) showNoJobs() {
 	for i := range m.slots {
-		m.slots[i].header.Hide()
-		m.slots[i].lastSync.Hide()
-		m.slots[i].fileCount.Hide()
-		m.slots[i].removeBtn.Hide()
+		m.slots[i].jobID = ""
+		m.slots[i].hide()
 	}
 	m.noJobs.Show()
 }
@@ -211,32 +226,15 @@ func handleRemove(client *apiclient.Client, r *refresher, jobID string) {
 }
 
 func handleStopAll(client *apiclient.Client, r *refresher) {
-	client.Shutdown()
-	// Wait for the daemon to fully stop before refreshing, so the Start
-	// button only appears once the socket is gone and EnsureRunning will
-	// actually launch a new process rather than seeing a live (dying) daemon.
-	for i := 0; i < 25; i++ {
-		time.Sleep(200 * time.Millisecond)
-		if client.Ping() != nil {
-			break
-		}
-	}
-	r.now()
-}
-
-func (m *appMenu) handleStartDaemon(mgr *DaemonManager, r *refresher) {
-	m.daemonStatus.SetTitle("Daemon: Starting…")
-	if err := mgr.EnsureRunning(); err != nil {
-		log.Printf("start daemon: %v", err)
-		m.daemonStatus.SetTitle("Daemon: Failed to start — " + err.Error())
+	if err := client.Shutdown(); err != nil {
+		// The daemon is already gone; that is what the menu wanted anyway.
+		r.now()
 		return
 	}
 	r.now()
 }
 
-// jobDisplayName derives a human-readable name from a config file path.
-// e.g. "/home/user/photos.example.com.yaml" → "photos.example.com"
-func jobDisplayName(configPath string) string {
-	base := filepath.Base(configPath)
-	return strings.TrimSuffix(base, filepath.Ext(base))
+func (m *appMenu) handleStartDaemon(mgr *DaemonManager, r *refresher) {
+	mgr.EnsureRunning()
+	r.now()
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/r1chjames/sftp-sync/internal/apiclient"
 	"github.com/r1chjames/sftp-sync/internal/daemon"
+	"github.com/r1chjames/sftp-sync/internal/humanize"
 )
 
 // Exit codes. Usage errors are separated from request failures so scripts can
@@ -202,7 +203,7 @@ func printJobList(w io.Writer, jobs []daemon.JobResponse) {
 			errStr = "-"
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
-			j.ID, phaseLabel(j.Status), j.ConfigPath, formatTime(j.Status.LastSync),
+			j.ID, humanize.Phase(j.Status.Phase, j.Status.Paused), j.ConfigPath, formatTime(j.Status.LastSync),
 			j.Status.FilesTotal, formatBatch(j.Status), errStr)
 	}
 	tw.Flush()
@@ -221,14 +222,14 @@ func jobDetailLines(j daemon.JobResponse) []string {
 		fmt.Sprintf("id:            %s", j.ID),
 		fmt.Sprintf("config:        %s", j.ConfigPath),
 		fmt.Sprintf("added:         %s", formatTime(j.AddedAt)),
-		fmt.Sprintf("phase:         %s", phaseLabel(j.Status)),
+		fmt.Sprintf("phase:         %s", humanize.Phase(j.Status.Phase, j.Status.Paused)),
 		fmt.Sprintf("paused:        %s", yesNo(j.Status.Paused)),
 		fmt.Sprintf("last sync:     %s", formatTime(j.Status.LastSync)),
 		fmt.Sprintf("last success:  %s", formatTime(j.Status.LastSuccessfulSync)),
 		fmt.Sprintf("files:         %d", j.Status.FilesTotal),
 		fmt.Sprintf("eligible:      %d", j.Status.EligibleFiles),
 		fmt.Sprintf("batch:         %s", formatBatch(j.Status)),
-		fmt.Sprintf("bytes:         %s", formatByteProgress(j.Status)),
+		fmt.Sprintf("bytes:         %s", humanize.BytePair(j.Status.BytesCompleted, j.Status.BytesTotal)),
 	}
 
 	if !j.Status.StartedAt.IsZero() {
@@ -237,21 +238,12 @@ func jobDetailLines(j daemon.JobResponse) []string {
 	if j.Status.CurrentFile != "" {
 		lines = append(lines, fmt.Sprintf("current file:  %s", j.Status.CurrentFile))
 		lines = append(lines, fmt.Sprintf("current bytes: %s",
-			formatBytePair(j.Status.CurrentFileBytesCompleted, j.Status.CurrentFileBytesTotal)))
+			humanize.BytePair(j.Status.CurrentFileBytesCompleted, j.Status.CurrentFileBytesTotal)))
 	}
 	if j.Status.LastError != "" {
 		lines = append(lines, fmt.Sprintf("error:         %s", j.Status.LastError))
 	}
 	return lines
-}
-
-// phaseLabel shows the paused state alongside the phase, because a paused job
-// that is draining a batch still reports the downloading phase.
-func phaseLabel(status daemon.StatusResponse) string {
-	if status.Paused && status.Phase != "paused" {
-		return status.Phase + " (paused)"
-	}
-	return status.Phase
 }
 
 func yesNo(v bool) string {
@@ -275,41 +267,4 @@ func formatBatch(status daemon.StatusResponse) string {
 	}
 	return fmt.Sprintf("%d/%d complete, %d failed, %d remaining",
 		status.Completed, status.BatchTotal, status.Failed, status.Remaining)
-}
-
-// formatBytes renders a byte count with a binary unit prefix.
-func formatBytes(n int64) string {
-	if n < 1024 {
-		return fmt.Sprintf("%d B", n)
-	}
-	units := []string{"KB", "MB", "GB", "TB", "PB"}
-	value := float64(n)
-	i := -1
-	for value >= 1024 && i < len(units)-1 {
-		value /= 1024
-		i++
-	}
-	return fmt.Sprintf("%.1f %s", value, units[i])
-}
-
-// formatBytePair renders progress as a percentage, or "-" when the total is not
-// yet known. Completed bytes are clamped so a remote file that grew mid-transfer
-// cannot report more than 100%.
-func formatBytePair(completed, total int64) string {
-	if total <= 0 {
-		return "-"
-	}
-	if completed > total {
-		completed = total
-	}
-	if completed < 0 {
-		completed = 0
-	}
-	percent := completed * 100 / total
-	return fmt.Sprintf("%s of %s (%d%%)", formatBytes(completed), formatBytes(total), percent)
-}
-
-// formatByteProgress renders batch byte progress.
-func formatByteProgress(status daemon.StatusResponse) string {
-	return formatBytePair(status.BytesCompleted, status.BytesTotal)
 }
