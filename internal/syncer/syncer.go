@@ -27,21 +27,29 @@ const (
 	PhaseError       SyncPhase = "error"
 )
 
+// byteProgressInterval throttles byte-progress status updates so the status
+// mutex is not taken for every 32 KiB write of every worker.
+const byteProgressInterval = 200 * time.Millisecond
+
 // SyncStatus is a snapshot of the syncer's current state.
 type SyncStatus struct {
-	Phase              SyncPhase
-	LastSync           time.Time
-	LastSuccessfulSync time.Time
-	FilesTotal         int
-	Pending            int
-	EligibleFiles      int
-	BatchTotal         int
-	Completed          int
-	Failed             int
-	Remaining          int
-	CurrentFile        string
-	StartedAt          time.Time
-	LastError          error
+	Phase                     SyncPhase
+	LastSync                  time.Time
+	LastSuccessfulSync        time.Time
+	FilesTotal                int
+	Pending                   int
+	EligibleFiles             int
+	BatchTotal                int
+	Completed                 int
+	Failed                    int
+	Remaining                 int
+	BytesTotal                int64
+	BytesCompleted            int64
+	CurrentFile               string
+	CurrentFileBytesTotal     int64
+	CurrentFileBytesCompleted int64
+	StartedAt                 time.Time
+	LastError                 error
 }
 
 // Syncer polls an SFTP server and downloads new or changed files.
@@ -90,8 +98,17 @@ func (s *Syncer) Stop() {
 // Status returns a snapshot of the current sync state. Safe for concurrent use.
 func (s *Syncer) Status() SyncStatus {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.status
+	st := s.status
+	s.mu.RUnlock()
+
+	// A remote file can grow between the walk and the transfer, which would
+	// otherwise publish more completed bytes than the batch total. Clamp the
+	// published snapshot rather than the live counters so failure corrections
+	// stay exact.
+	if st.BytesTotal > 0 && st.BytesCompleted > st.BytesTotal {
+		st.BytesCompleted = st.BytesTotal
+	}
+	return st
 }
 
 func (s *Syncer) beginScan() {
@@ -103,7 +120,11 @@ func (s *Syncer) beginScan() {
 	s.status.Failed = 0
 	s.status.Remaining = 0
 	s.status.Pending = 0
+	s.status.BytesTotal = 0
+	s.status.BytesCompleted = 0
 	s.status.CurrentFile = ""
+	s.status.CurrentFileBytesTotal = 0
+	s.status.CurrentFileBytesCompleted = 0
 	s.status.StartedAt = time.Now()
 }
 
@@ -114,13 +135,74 @@ func (s *Syncer) setEligibleFiles(total int) {
 	s.status.FilesTotal = total
 }
 
-func (s *Syncer) beginDownload(total int) {
+func (s *Syncer) beginDownload(total int, totalBytes int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status.Phase = PhaseDownloading
 	s.status.BatchTotal = total
 	s.status.Remaining = total
 	s.status.Pending = total
+	s.status.BytesTotal = totalBytes
+	s.status.BytesCompleted = 0
+}
+
+// fileProgress tracks the bytes copied for one file and forwards deltas to the
+// syncer. Updates are throttled so the status mutex is not taken on every write
+// of every worker. Emitted bytes are always less than or equal to copied bytes,
+// and flush reports any remainder.
+type fileProgress struct {
+	total    int64
+	interval time.Duration
+	now      func() time.Time
+	record   func(delta, copied, total int64)
+
+	copied   int64
+	reported int64
+	lastEmit time.Time
+}
+
+// update records the cumulative byte count reported by a single file transfer.
+// It matches the signature expected by sftp.DownloadTempProgress.
+func (p *fileProgress) update(copied int64) error {
+	p.copied = copied
+	if copied == p.reported {
+		return nil
+	}
+	if !p.lastEmit.IsZero() && p.now().Sub(p.lastEmit) < p.interval {
+		return nil
+	}
+	p.emit()
+	return nil
+}
+
+// flush reports bytes withheld by throttling. Call it before recording the
+// file's outcome so a failure subtracts exactly what the file contributed.
+func (p *fileProgress) flush() {
+	p.emit()
+}
+
+func (p *fileProgress) emit() {
+	delta := p.copied - p.reported
+	if delta <= 0 {
+		return
+	}
+	p.reported = p.copied
+	p.lastEmit = p.now()
+	p.record(delta, p.copied, p.total)
+}
+
+// recordBytes adds newly copied bytes for an in-flight file to the batch
+// totals. With several workers running, the per-file fields describe whichever
+// file last reported and are best-effort by design.
+func (s *Syncer) recordBytes(path string, delta, fileCopied, fileTotal int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if delta > 0 {
+		s.status.BytesCompleted += delta
+	}
+	s.status.CurrentFile = path
+	s.status.CurrentFileBytesCompleted = fileCopied
+	s.status.CurrentFileBytesTotal = fileTotal
 }
 
 func (s *Syncer) setCurrentFile(path string) {
@@ -129,11 +211,19 @@ func (s *Syncer) setCurrentFile(path string) {
 	s.status.CurrentFile = path
 }
 
-func (s *Syncer) recordFileResult(path string, err error) {
+// recordFileResult updates the batch counters after a single file completes.
+// fileBytes is the number of bytes copied for that file: on failure those
+// bytes were written to a temp file that is removed, so they must not count
+// towards completed bytes.
+func (s *Syncer) recordFileResult(path string, err error, fileBytes int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
 		s.status.Failed++
+		s.status.BytesCompleted -= fileBytes
+		if s.status.BytesCompleted < 0 {
+			s.status.BytesCompleted = 0
+		}
 	} else {
 		s.status.Completed++
 	}
@@ -218,8 +308,12 @@ func (s *Syncer) sync(ctx context.Context) error {
 	}
 
 	if len(toDownload) > 0 {
-		log.Printf("downloading %d new/changed file(s) (of %d eligible)", len(toDownload), eligible)
-		s.beginDownload(len(toDownload))
+		var batchBytes int64
+		for _, f := range toDownload {
+			batchBytes += f.Size
+		}
+		log.Printf("downloading %d new/changed file(s) (of %d eligible, %d bytes)", len(toDownload), eligible, batchBytes)
+		s.beginDownload(len(toDownload), batchBytes)
 		if err := s.downloadAll(ctx, toDownload); err != nil {
 			return err
 		}
@@ -280,10 +374,21 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 
 			s.setCurrentFile(f.Path)
 
+			fp := &fileProgress{
+				total:    f.Size,
+				interval: byteProgressInterval,
+				now:      time.Now,
+				record:   func(delta, copied, total int64) { s.recordBytes(f.Path, delta, copied, total) },
+			}
+
 			// Stage the download to a temp file so we can inspect it.
-			tmpPath, err := s.client.DownloadTemp(f.Path, s.cfg.LocalPath)
+			tmpPath, err := s.client.DownloadTempProgress(f.Path, s.cfg.LocalPath, fp.update)
+
+			// Flush bytes withheld by throttling before recording any outcome,
+			// so a failure subtracts exactly what this file contributed.
+			fp.flush()
 			if err != nil {
-				s.recordFileResult(f.Path, err)
+				s.recordFileResult(f.Path, err, fp.copied)
 				results <- result{file: f, err: err}
 				return
 			}
@@ -301,7 +406,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			if err := os.MkdirAll(filepath.Dir(finalPath), 0755); err != nil {
 				os.Remove(tmpPath)
 				err = fmt.Errorf("mkdir: %w", err)
-				s.recordFileResult(f.Path, err)
+				s.recordFileResult(f.Path, err, fp.copied)
 				results <- result{file: f, err: err}
 				return
 			}
@@ -309,7 +414,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 			if err := os.Rename(tmpPath, finalPath); err != nil {
 				os.Remove(tmpPath)
 				err = fmt.Errorf("rename: %w", err)
-				s.recordFileResult(f.Path, err)
+				s.recordFileResult(f.Path, err, fp.copied)
 				results <- result{file: f, err: err}
 				return
 			}
@@ -323,7 +428,7 @@ func (s *Syncer) downloadAll(ctx context.Context, files []sftpclient.RemoteFile)
 				log.Printf("warning: could not set file times for %s: %v", finalPath, err)
 			}
 
-			s.recordFileResult(f.Path, nil)
+			s.recordFileResult(f.Path, nil, fp.copied)
 			results <- result{file: f, err: nil}
 		}(f)
 	}

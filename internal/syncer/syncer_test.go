@@ -82,9 +82,9 @@ func TestStatusTransitions(t *testing.T) {
 
 	s.markFailure(errors.New("previous failure"))
 	lastAttempt := s.Status().LastSync
-	s.beginDownload(3)
+	s.beginDownload(3, 0)
 	s.setCurrentFile("/photos/a.jpg")
-	s.recordFileResult("/photos/a.jpg", nil)
+	s.recordFileResult("/photos/a.jpg", nil, 0)
 	s.beginScan()
 
 	st := s.Status()
@@ -97,6 +97,9 @@ func TestStatusTransitions(t *testing.T) {
 	if st.CurrentFile != "" || st.StartedAt.IsZero() {
 		t.Fatalf("scan current/start state = %q/%v", st.CurrentFile, st.StartedAt)
 	}
+	if st.BytesTotal != 0 || st.BytesCompleted != 0 || st.CurrentFileBytesTotal != 0 || st.CurrentFileBytesCompleted != 0 {
+		t.Fatalf("scan did not reset byte counters: %+v", st)
+	}
 	if st.LastError == nil || st.LastError.Error() != "previous failure" {
 		t.Fatalf("scan cleared previous error: %v", st.LastError)
 	}
@@ -105,11 +108,11 @@ func TestStatusTransitions(t *testing.T) {
 	}
 
 	s.setEligibleFiles(8)
-	s.beginDownload(3)
+	s.beginDownload(3, 0)
 	s.setCurrentFile("/photos/a.jpg")
-	s.recordFileResult("/photos/a.jpg", nil)
+	s.recordFileResult("/photos/a.jpg", nil, 0)
 	s.setCurrentFile("/photos/b.jpg")
-	s.recordFileResult("/photos/b.jpg", errors.New("copy failed"))
+	s.recordFileResult("/photos/b.jpg", errors.New("copy failed"), 0)
 	st = s.Status()
 	if st.Phase != PhaseDownloading || st.FilesTotal != 8 || st.EligibleFiles != 8 {
 		t.Fatalf("download phase/totals incorrect: %+v", st)
@@ -123,8 +126,8 @@ func TestMarkFailurePreservesLastSuccessAndCounters(t *testing.T) {
 	s := New(&config.Config{})
 	s.markSuccess()
 	lastSuccess := s.Status().LastSuccessfulSync
-	s.beginDownload(2)
-	s.recordFileResult("/photos/a.jpg", nil)
+	s.beginDownload(2, 0)
+	s.recordFileResult("/photos/a.jpg", nil, 0)
 
 	s.markFailure(errors.New("batch failed"))
 	st := s.Status()
@@ -142,6 +145,154 @@ func TestMarkFailurePreservesLastSuccessAndCounters(t *testing.T) {
 	st = s.Status()
 	if st.Phase != PhaseIdle || st.LastError != nil || st.LastSuccessfulSync.IsZero() {
 		t.Fatalf("success state incorrect: %+v", st)
+	}
+}
+
+func TestByteProgressAccounting(t *testing.T) {
+	s := New(&config.Config{})
+	s.beginDownload(2, 300)
+
+	st := s.Status()
+	if st.BytesTotal != 300 || st.BytesCompleted != 0 {
+		t.Fatalf("batch bytes = %d/%d, want 0/300", st.BytesCompleted, st.BytesTotal)
+	}
+
+	s.recordBytes("/photos/a.jpg", 120, 120, 100)
+	st = s.Status()
+	if st.BytesCompleted != 120 {
+		t.Fatalf("completed bytes = %d, want 120", st.BytesCompleted)
+	}
+	if st.CurrentFile != "/photos/a.jpg" || st.CurrentFileBytesCompleted != 120 || st.CurrentFileBytesTotal != 100 {
+		t.Fatalf("current file bytes not tracked: %+v", st)
+	}
+
+	// A remote file that grew after the walk must not push published progress
+	// above the batch total.
+	s.recordBytes("/photos/b.jpg", 260, 260, 200)
+	st = s.Status()
+	if st.BytesCompleted != st.BytesTotal {
+		t.Fatalf("completed bytes = %d, want clamp to %d", st.BytesCompleted, st.BytesTotal)
+	}
+}
+
+func TestFileProgressThrottlingAndFlush(t *testing.T) {
+	clock := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+	type emit struct{ delta, copied, total int64 }
+	var emits []emit
+
+	p := &fileProgress{
+		total:    4096,
+		interval: byteProgressInterval,
+		now:      func() time.Time { return clock },
+		record:   func(delta, copied, total int64) { emits = append(emits, emit{delta, copied, total}) },
+	}
+
+	// First update emits immediately so a transfer that finishes inside one
+	// interval still reports progress.
+	if err := p.update(1024); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(emits) != 1 || emits[0].delta != 1024 || emits[0].total != 4096 {
+		t.Fatalf("first emit = %+v, want one delta of 1024", emits)
+	}
+
+	// Updates inside the interval are withheld.
+	clock = clock.Add(50 * time.Millisecond)
+	if err := p.update(2048); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(emits) != 1 {
+		t.Fatalf("throttled update emitted: %+v", emits)
+	}
+
+	// Once the interval passes the withheld delta is reported in full.
+	clock = clock.Add(byteProgressInterval)
+	if err := p.update(3072); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(emits) != 2 || emits[1].delta != 2048 || emits[1].copied != 3072 {
+		t.Fatalf("second emit = %+v, want delta 2048 at 3072", emits)
+	}
+
+	// The final flush reports the remainder, so emitted bytes always equal
+	// copied bytes and a failure can subtract the exact contribution.
+	if err := p.update(4096); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	p.flush()
+	if p.reported != p.copied {
+		t.Fatalf("reported %d != copied %d after flush", p.reported, p.copied)
+	}
+	var totalEmitted int64
+	for _, e := range emits {
+		totalEmitted += e.delta
+	}
+	if totalEmitted != p.copied {
+		t.Fatalf("emitted %d bytes, copied %d", totalEmitted, p.copied)
+	}
+
+	// A second flush is a no-op.
+	before := len(emits)
+	p.flush()
+	if len(emits) != before {
+		t.Fatalf("repeated flush emitted again: %+v", emits[before:])
+	}
+}
+
+func TestFileProgressFailureSubtractsExactlyTheContribution(t *testing.T) {
+	s := New(&config.Config{})
+	s.beginDownload(1, 2048)
+
+	clock := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+	p := &fileProgress{
+		total:    2048,
+		interval: byteProgressInterval,
+		now:      func() time.Time { return clock },
+		record:   func(delta, copied, total int64) { s.recordBytes("/photos/a.raw", delta, copied, total) },
+	}
+
+	// Copy succeeds but the bytes are withheld by throttling, then placement
+	// fails. Subtracting the full file size must not wipe unrelated progress.
+	if err := p.update(2048); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	p.flush()
+	if got := s.Status().BytesCompleted; got != 2048 {
+		t.Fatalf("completed bytes = %d, want 2048", got)
+	}
+
+	s.recordFileResult("/photos/a.raw", errors.New("rename: permission denied"), p.copied)
+	if got := s.Status().BytesCompleted; got != 0 {
+		t.Fatalf("completed bytes after failure = %d, want 0", got)
+	}
+}
+
+func TestRecordFileResultRemovesFailedBytes(t *testing.T) {
+	s := New(&config.Config{})
+	s.beginDownload(2, 300)
+	s.recordBytes("/photos/a.jpg", 100, 100, 100)
+	s.recordFileResult("/photos/a.jpg", nil, 100)
+	s.recordBytes("/photos/b.jpg", 200, 200, 200)
+
+	st := s.Status()
+	if st.BytesCompleted != 300 {
+		t.Fatalf("completed bytes = %d, want 300", st.BytesCompleted)
+	}
+
+	// b.jpg copied fully but failed to be placed: its bytes were not committed.
+	s.recordFileResult("/photos/b.jpg", errors.New("rename: permission denied"), 200)
+	st = s.Status()
+	if st.BytesCompleted != 100 {
+		t.Fatalf("completed bytes after failure = %d, want 100", st.BytesCompleted)
+	}
+	if st.Completed != 1 || st.Failed != 1 || st.Remaining != 0 || st.Pending != 0 {
+		t.Fatalf("file counters incorrect after failure: %+v", st)
+	}
+
+	// A failure correction must never drive the total negative.
+	s.recordFileResult("/photos/c.jpg", errors.New("copy failed"), 999)
+	if got := s.Status().BytesCompleted; got != 0 {
+		t.Fatalf("completed bytes = %d, want 0", got)
 	}
 }
 
