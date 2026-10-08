@@ -321,15 +321,15 @@ func TestRecordCycle(t *testing.T) {
 	}
 }
 
-func TestBatchInterruptedError(t *testing.T) {
-	if err := batchInterruptedError(3, 3, context.Canceled); err != nil {
+func TestIncompleteBatchError(t *testing.T) {
+	if err := incompleteBatchError(3, 3, context.Canceled); err != nil {
 		t.Fatalf("fully attempted batch error = %v, want nil", err)
 	}
-	if err := batchInterruptedError(1, 3, nil); err != nil {
-		t.Fatalf("live context error = %v, want nil", err)
+	if err := incompleteBatchError(1, 3, nil); !errors.Is(err, errBatchPaused) {
+		t.Fatalf("paused batch error = %v, want errBatchPaused", err)
 	}
 
-	err := batchInterruptedError(1, 3, context.Canceled)
+	err := incompleteBatchError(1, 3, context.Canceled)
 	if err == nil {
 		t.Fatal("interrupted batch returned nil")
 	}
