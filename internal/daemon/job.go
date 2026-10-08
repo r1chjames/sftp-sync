@@ -39,9 +39,14 @@ type StatusResponse struct {
 	Completed          int       `json:"completed"`
 	Failed             int       `json:"failed"`
 	Remaining          int       `json:"remaining"`
-	CurrentFile        string    `json:"current_file,omitempty"`
-	StartedAt          time.Time `json:"started_at,omitempty"`
-	LastError          string    `json:"last_error,omitempty"`
+	BytesTotal         int64     `json:"bytes_total"`
+	BytesCompleted     int64     `json:"bytes_completed"`
+
+	CurrentFile               string    `json:"current_file,omitempty"`
+	CurrentFileBytesTotal     int64     `json:"current_file_bytes_total"`
+	CurrentFileBytesCompleted int64     `json:"current_file_bytes_completed"`
+	StartedAt                 time.Time `json:"started_at,omitempty"`
+	LastError                 string    `json:"last_error,omitempty"`
 }
 
 func (j *Job) toResponse() JobResponse {
@@ -57,8 +62,13 @@ func (j *Job) toResponse() JobResponse {
 		Completed:          st.Completed,
 		Failed:             st.Failed,
 		Remaining:          st.Remaining,
-		CurrentFile:        st.CurrentFile,
-		StartedAt:          st.StartedAt,
+		BytesTotal:         st.BytesTotal,
+		BytesCompleted:     st.BytesCompleted,
+
+		CurrentFile:               st.CurrentFile,
+		CurrentFileBytesTotal:     st.CurrentFileBytesTotal,
+		CurrentFileBytesCompleted: st.CurrentFileBytesCompleted,
+		StartedAt:                 st.StartedAt,
 	}
 	if st.LastError != nil {
 		sr.LastError = st.LastError.Error()

@@ -156,6 +156,7 @@ func printJobDetail(j daemon.JobResponse) {
 	fmt.Printf("last success: %s\n", lastSuccessfulSync)
 	fmt.Printf("files:        %d\n", j.Status.FilesTotal)
 	fmt.Printf("batch:        %s\n", formatBatch(j.Status))
+	fmt.Printf("bytes:        %s\n", formatByteProgress(j.Status))
 	if !j.Status.StartedAt.IsZero() {
 		fmt.Printf("started:      %s\n", j.Status.StartedAt.Format("2006-01-02 15:04:05"))
 	}
@@ -173,6 +174,39 @@ func formatBatch(status daemon.StatusResponse) string {
 	}
 	return fmt.Sprintf("%d/%d complete, %d failed, %d remaining",
 		status.Completed, status.BatchTotal, status.Failed, status.Remaining)
+}
+
+// formatBytes renders a byte count with a binary unit prefix.
+func formatBytes(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
+	value := float64(n)
+	i := -1
+	for value >= 1024 && i < len(units)-1 {
+		value /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", value, units[i])
+}
+
+// formatByteProgress renders batch byte progress as a percentage, or "-" when
+// the batch size is not yet known. Completed bytes are clamped so a remote file
+// that grew mid-transfer cannot report more than 100%.
+func formatByteProgress(status daemon.StatusResponse) string {
+	if status.BytesTotal <= 0 {
+		return "-"
+	}
+	completed := status.BytesCompleted
+	if completed > status.BytesTotal {
+		completed = status.BytesTotal
+	}
+	if completed < 0 {
+		completed = 0
+	}
+	percent := completed * 100 / status.BytesTotal
+	return fmt.Sprintf("%s of %s (%d%%)", formatBytes(completed), formatBytes(status.BytesTotal), percent)
 }
 
 func fatalf(format string, args ...any) {

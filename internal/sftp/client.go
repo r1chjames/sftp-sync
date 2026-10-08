@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	"github.com/r1chjames/sftp-sync/internal/config"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
-	"github.com/r1chjames/sftp-sync/internal/config"
 )
 
 // RemoteFile represents a file discovered on the SFTP server.
@@ -24,9 +24,9 @@ type RemoteFile struct {
 
 // Client wraps an SFTP connection and provides high-level operations.
 type Client struct {
-	cfg    *config.Config
-	conn   *ssh.Client
-	sftpc  *sftp.Client
+	cfg   *config.Config
+	conn  *ssh.Client
+	sftpc *sftp.Client
 }
 
 func New(cfg *config.Config) *Client {
@@ -140,6 +140,13 @@ func (c *Client) Download(remotePath, localPath string) error {
 // DownloadTemp downloads a remote file into stagingDir and returns the path to
 // the temp file. The caller is responsible for removing or renaming the file.
 func (c *Client) DownloadTemp(remotePath, stagingDir string) (string, error) {
+	return c.DownloadTempProgress(remotePath, stagingDir, nil)
+}
+
+// DownloadTempProgress behaves like DownloadTemp and additionally reports the
+// cumulative number of bytes copied. progress may be nil. If progress returns
+// an error the transfer stops and the temp file is removed.
+func (c *Client) DownloadTempProgress(remotePath, stagingDir string, progress func(copied int64) error) (string, error) {
 	src, err := c.sftpc.Open(remotePath)
 	if err != nil {
 		return "", fmt.Errorf("open remote: %w", err)
@@ -156,7 +163,7 @@ func (c *Client) DownloadTemp(remotePath, stagingDir string) (string, error) {
 	}
 	defer dst.Close()
 
-	if _, err := io.Copy(dst, src); err != nil {
+	if _, err := copyWithProgress(dst, src, progress); err != nil {
 		os.Remove(dst.Name())
 		return "", fmt.Errorf("copy: %w", err)
 	}
@@ -167,6 +174,35 @@ func (c *Client) DownloadTemp(remotePath, stagingDir string) (string, error) {
 	}
 
 	return dst.Name(), nil
+}
+
+// progressWriter counts bytes written and reports the running total after each
+// write. It deliberately holds no state beyond the counter so concurrent
+// workers cannot interfere with each other.
+type progressWriter struct {
+	w        io.Writer
+	progress func(copied int64) error
+	copied   int64
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	if n > 0 {
+		p.copied += int64(n)
+		if p.progress != nil {
+			if perr := p.progress(p.copied); perr != nil {
+				return n, perr
+			}
+		}
+	}
+	return n, err
+}
+
+// copyWithProgress copies src into dst and reports cumulative bytes written.
+// It streams through io.Copy, so it never buffers a whole photo in memory.
+func copyWithProgress(dst io.Writer, src io.Reader, progress func(copied int64) error) (int64, error) {
+	pw := &progressWriter{w: dst, progress: progress}
+	return io.Copy(pw, src)
 }
 
 func (c *Client) authMethods() ([]ssh.AuthMethod, error) {
