@@ -189,6 +189,11 @@ func (s *Syncer) Start(ctx context.Context) error {
 	}
 	s.manifest = m
 
+	// Startup is the only moment when no download of this job can be in flight,
+	// so it is the only safe time to remove staging files a previous run left
+	// behind.
+	s.pruneStaging(s.cfg.LocalPath, time.Now())
+
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 	go s.run(ctx)
@@ -475,6 +480,25 @@ func (s *Syncer) run(ctx context.Context) {
 	}
 }
 
+// partialScanError reports an incomplete walk: it logs every unreadable path the
+// result kept, and returns a bounded summary so the cycle is visibly partial.
+//
+// A walk that read everything returns nil, so a healthy cycle is never marked
+// failed by this.
+func partialScanError(walk sftpclient.WalkResult) error {
+	if walk.Complete() {
+		return nil
+	}
+
+	for _, failure := range walk.Failures {
+		log.Printf("could not read remote path %s: %v", failure.Path, failure.Err)
+	}
+
+	err := errors.New(walk.Summary())
+	log.Printf("warning: %s", err)
+	return err
+}
+
 func (s *Syncer) sync(ctx context.Context) error {
 	s.beginScan()
 
@@ -482,13 +506,19 @@ func (s *Syncer) sync(ctx context.Context) error {
 		return fmt.Errorf("connect: %w", err)
 	}
 
-	remoteFiles, err := s.client.Walk(s.cfg.SFTP.RemotePath)
+	walk, err := s.client.Walk(ctx, s.cfg.SFTP.RemotePath)
 	if err != nil {
 		s.client.Close() // force reconnect on next poll
 		return fmt.Errorf("walk %s: %w", s.cfg.SFTP.RemotePath, err)
 	}
 
-	eligible, toDownload := s.selectForDownload(ctx, remoteFiles)
+	// A walk that could not read part of the tree did not see the whole server.
+	// Every unreadable path is logged as it is found, and the cycle is reported
+	// as failed even when the files it did see synced correctly: no caller may
+	// mistake a partial scan for an inventory of what the remote has.
+	partialErr := partialScanError(walk)
+
+	eligible, toDownload := s.selectForDownload(ctx, walk.Files)
 	s.setEligibleFiles(eligible)
 
 	if err := s.manifest.Save(); err != nil {
@@ -501,6 +531,15 @@ func (s *Syncer) sync(ctx context.Context) error {
 			batchBytes += f.Size
 		}
 		log.Printf("downloading %d new/changed file(s) (of %d eligible, %d bytes)", len(toDownload), eligible, batchBytes)
+
+		// Refuse to start a batch the filesystem cannot hold. This is a guard
+		// before the transfer rather than a promise: other processes and other
+		// jobs share the filesystem, and the space can be gone by the time the
+		// last file is written.
+		if err := s.checkSpace(s.cfg.LocalPath, batchBytes); err != nil {
+			return err
+		}
+
 		s.beginDownload(len(toDownload), batchBytes)
 		result, err := s.downloadAll(ctx, toDownload)
 		if err != nil {
@@ -510,6 +549,12 @@ func (s *Syncer) sync(ctx context.Context) error {
 			result.Completed, result.Skipped, result.Failed, result.Attempted)
 	} else {
 		log.Printf("up to date — %d eligible remote file(s)", eligible)
+	}
+
+	// A download failure is the more urgent problem and is reported ahead of a
+	// partial scan, which the log records either way.
+	if partialErr != nil && ctx.Err() == nil {
+		return partialErr
 	}
 
 	return nil

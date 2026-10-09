@@ -185,6 +185,31 @@ warning is logged and the file is kept without a digest rather than being
 discarded — a file that transferred successfully should not be thrown away
 because it could not be checked afterwards.
 
+### Partial scans, free space, and leftover staging files
+
+A subdirectory the daemon cannot read does not stop a sync, but it does mean the
+scan saw only part of the server, so the cycle is reported as **failed** with a
+bounded summary and every unreadable path is logged:
+
+```
+error: remote scan incomplete: 3 path(s) could not be read; first /photos/private: permission denied (2 more in the daemon log)
+```
+
+This matters beyond the log line: a partial scan is not an inventory of the
+server, so nothing — including any future feature that deletes local files the
+remote no longer has — may treat it as one.
+
+Before a batch starts, the free space on the destination filesystem is compared
+with the size of the batch plus 64 MiB. If it will not fit, the cycle fails
+before downloading anything instead of filling the disk. Where free space cannot
+be queried, the check is skipped and the sync proceeds.
+
+When a job starts, staging files (`.sftpsync-*`) left in the destination by an
+interrupted run are removed, but only ones older than 24 hours. A fresh staging
+file may belong to a download in progress in this or another process, and
+deleting it would corrupt that transfer. Ordinary files are never removed,
+whatever their names or ages.
+
 ### Failures and retries
 
 A file transfer that fails on a dropped connection, a timeout, or a truncated

@@ -2,6 +2,7 @@ package sftp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,11 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
+
+// StagingPrefix is the name prefix of the temp files a download writes before
+// it is moved into place. Cleanup code matches this prefix, so the two must not
+// drift apart.
+const StagingPrefix = ".sftpsync-"
 
 // RemoteFile represents a file discovered on the SFTP server.
 type RemoteFile struct {
@@ -200,30 +206,128 @@ func (c *Client) HashRemote(ctx context.Context, remotePath string) (string, err
 	return verify.SHA256Stream(ctx, src)
 }
 
-// Walk returns all regular files under remotePath recursively.
-func (c *Client) Walk(remotePath string) ([]RemoteFile, error) {
-	client, err := c.ready()
-	if err != nil {
-		return nil, err
+// errNoStat stands in for a stat that returned no information at all.
+var errNoStat = errors.New("no file information")
+
+// maxWalkFailures bounds how many unreadable paths are kept in a walk result.
+// A broken subtree can produce one failure per entry, and the status summary must
+// not grow with it.
+const maxWalkFailures = 20
+
+// WalkFailure is one path a walk could not read.
+type WalkFailure struct {
+	Path string
+	Err  error
+}
+
+// WalkResult is what a recursive walk found, including what it could not read.
+//
+// The distinction matters: a walk that skipped an unreadable subtree is not an
+// inventory of the server, so no caller may treat it as one — least of all a
+// future feature that deletes local files the remote no longer has.
+type WalkResult struct {
+	Files []RemoteFile
+	// Failures holds up to maxWalkFailures of the unreadable paths.
+	Failures []WalkFailure
+	// FailureCount is the total number of unreadable paths, including any
+	// beyond the cap.
+	FailureCount int
+}
+
+// Complete reports whether every path the walk visited could be read.
+func (w WalkResult) Complete() bool { return w.FailureCount == 0 }
+
+// Summary describes a partial walk in a bounded string, naming the first failure
+// and counting the rest. Every failed path is logged as it is found.
+func (w WalkResult) Summary() string {
+	if w.Complete() {
+		return ""
 	}
 
-	walker := client.Walk(remotePath)
-	var files []RemoteFile
+	summary := fmt.Sprintf("remote scan incomplete: %d path(s) could not be read; first %s",
+		w.FailureCount, w.Failures[0].Path)
+	if detail := w.Failures[0].Err.Error(); detail != "" {
+		summary += ": " + detail
+	}
+	if w.FailureCount > 1 {
+		summary += fmt.Sprintf(" (%d more in the daemon log)", w.FailureCount-1)
+	}
+	return summary
+}
+
+// walkSteps is the part of *sftp.Walker that a walk uses, so the aggregation —
+// including the failure cap and the cancellation check — can be tested without a
+// server.
+type walkSteps interface {
+	Step() bool
+	Path() string
+	Stat() os.FileInfo
+	Err() error
+}
+
+// Walk returns all regular files under remotePath recursively.
+//
+// An unreadable entry does not stop the walk: the files that could be read are
+// returned, and the failures are reported in the result so the cycle can say it
+// only saw part of the server. The error return is reserved for a walk that could
+// not start at all, or one interrupted by cancellation.
+func (c *Client) Walk(ctx context.Context, remotePath string) (WalkResult, error) {
+	client, err := c.ready()
+	if err != nil {
+		return WalkResult{}, err
+	}
+
+	return walkFiles(ctx, remotePath, client.Walk(remotePath))
+}
+
+// walkFiles performs the walk and collects what it found.
+func walkFiles(ctx context.Context, root string, walker walkSteps) (WalkResult, error) {
+	var result WalkResult
+
 	for walker.Step() {
-		if err := walker.Err(); err != nil {
-			continue // skip unreadable entries
+		if err := ctx.Err(); err != nil {
+			// Stopping mid-walk leaves the inventory incomplete, so the error is
+			// reported rather than returned as a shorter list of files.
+			return result, err
 		}
+
+		path := walker.Path()
+		if err := walker.Err(); err != nil {
+			if path == root {
+				// The root of the walk is unreadable, so there is nothing to report
+				// on: this is the configuration pointing at a path that does not
+				// exist, not a partial scan.
+				return result, fmt.Errorf("unreadable: %w", err)
+			}
+
+			result.FailureCount++
+			if len(result.Failures) < maxWalkFailures {
+				result.Failures = append(result.Failures, WalkFailure{Path: path, Err: err})
+			}
+			continue
+		}
+
 		info := walker.Stat()
+		if info == nil {
+			// A stat that returned nothing is as unreadable as one that errored.
+			result.FailureCount++
+			if len(result.Failures) < maxWalkFailures {
+				result.Failures = append(result.Failures, WalkFailure{Path: path, Err: errNoStat})
+			}
+			continue
+		}
 		if info.IsDir() {
 			continue
 		}
-		files = append(files, RemoteFile{
-			Path:  walker.Path(),
+
+		result.Files = append(result.Files, RemoteFile{
+			Path:  path,
 			MTime: info.ModTime(),
 			Size:  info.Size(),
 		})
 	}
-	return files, nil
+
+	return result, nil
 }
 
 // Download copies a remote file to localPath, writing atomically via a temp file.
@@ -266,7 +370,7 @@ func (c *Client) DownloadTempProgress(remotePath, stagingDir string, progress fu
 		return "", fmt.Errorf("mkdir: %w", err)
 	}
 
-	dst, err := os.CreateTemp(stagingDir, ".sftpsync-*")
+	dst, err := os.CreateTemp(stagingDir, StagingPrefix+"*")
 	if err != nil {
 		return "", fmt.Errorf("create temp: %w", err)
 	}
